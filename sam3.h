@@ -88,6 +88,27 @@ struct sam3_mask {
     std::vector<uint8_t> data;  // binary mask (0 or 255)
 };
 
+// RFD 0011 U4: explicit tracker lifecycle state. All six states are DEFINED to
+// match the RFD 0011 contract and for forward-compatibility, but only the four
+// reachable states (TRACKED / AT_RISK / OCCLUDED / LOST) have transition logic
+// in this PR. CANDIDATE_REACQUIRE and REACQUIRED are entered only once an
+// appearance re-ID reacquire mechanism lands (RFD 0011 U6 / OSNet, roadmap) —
+// there is no driver for them here, so they are reserved, not dead live enums.
+// Design intent: "fail-lost, not fail-wrong" — ambiguous frames degrade to
+// AT_RISK / OCCLUDED and persistent loss becomes LOST, rather than reporting a
+// confident wrong-person track.
+enum class TargetState {
+    TRACKED,             // mask, motion, and objectness all agree
+    AT_RISK,             // a plausible target, but >=1 signal is degrading
+    OCCLUDED,            // target likely hidden; no credible mask this frame
+    LOST,                // no reliable target; do not chase (terminal until U6 reacquire)
+    CANDIDATE_REACQUIRE, // reserved — U6 (re-ID proposes a candidate)
+    REACQUIRED           // reserved — U6 (candidate confirmed)
+};
+
+// Human-readable lowercase name (also used in the bench JSON `state` field).
+const char* sam3_target_state_name(TargetState s);
+
 struct sam3_detection {
     sam3_box  box;
     float     score     = 0.0f;
@@ -95,6 +116,7 @@ struct sam3_detection {
     int       instance_id = -1;
     sam3_mask  mask;
     std::vector<float> sam_token;  // raw SAM decoder output token (for obj_ptr)
+    TargetState state   = TargetState::TRACKED;  // RFD 0011 U4: lifecycle state
 };
 
 struct sam3_result {

@@ -131,6 +131,7 @@ static bool parse_box_json(const std::string& path, sam3_box& out) {
 struct FrameRecord {
     int    frame_id    = 0;
     bool   tracked     = false;
+    std::string state  = "lost";         // RFD 0011 U4: lifecycle state name
     float  bbox[4]     = {0, 0, 0, 0};  // corner-normalized [x0,y0,x1,y1] in [0,1]
     float  confidence  = 0.0f;
     float  object_score = 0.0f;
@@ -364,6 +365,7 @@ int main(int argc, char** argv) {
         FrameRecord r0;
         r0.frame_id     = 0;
         r0.tracked      = true;
+        r0.state        = "tracked";  // RFD 0011 U4: seed frame is tracked by definition
         r0.is_seed      = true;
         r0.bbox[0]      = init_box.x0 / fw;
         r0.bbox[1]      = init_box.y0 / fh;
@@ -389,6 +391,7 @@ int main(int argc, char** argv) {
                 if (d.instance_id == inst_id) { det = &d; break; }
             }
             r.tracked       = true;
+            r.state         = sam3_target_state_name(det->state);  // RFD 0011 U4
             // det.box is in original-frame PIXEL corners; normalize to [0,1].
             r.bbox[0]       = det->box.x0 / fw;
             r.bbox[1]       = det->box.y0 / fh;
@@ -496,7 +499,7 @@ int main(int argc, char** argv) {
             if (i) js << ",";
             js << "\"" << r.frame_id << "\":{";
             js << "\"frame_id\":" << r.frame_id << ",";
-            js << "\"state\":\"" << (r.tracked ? "tracked" : "lost") << "\",";
+            js << "\"state\":\"" << r.state << "\",";  // RFD 0011 U4: real lifecycle state
             char bbuf[128];
             snprintf(bbuf, sizeof(bbuf), "\"bbox\":[%.6f,%.6f,%.6f,%.6f],",
                      r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3]);

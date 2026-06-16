@@ -1038,6 +1038,14 @@ struct sam3_masklet {
     // consume this as the motion-consistency signal that distinguishes a real
     // track from a wrong-person lock; U3 only populates it.
     float last_motion_iou = 1.0f;  // RFD 0011 U3: IoU(measured box, Kalman prediction) last frame (for U4)
+
+    // RFD 0011 U4: explicit lifecycle state + hysteresis counters. The state is
+    // driven each frame from {mask IoU, objectness, motion IoU, box validity,
+    // foreground area}; the counters provide hysteresis so a single bad frame
+    // does not flip TRACKED->LOST.
+    TargetState state         = TargetState::TRACKED;
+    int         degrade_count = 0;  // consecutive degraded (weak) frames in AT_RISK
+    int         occl_count    = 0;  // consecutive absent frames in OCCLUDED
 };
 
 struct sam3_memory_slot {
@@ -11783,6 +11791,79 @@ static std::vector<std::pair<int, int>> sam3_match_detections(
     return matches;
 }
 
+// RFD 0011 U4: lowercase state names (used in logs + the bench JSON).
+const char* sam3_target_state_name(TargetState s) {
+    switch (s) {
+        case TargetState::TRACKED:             return "tracked";
+        case TargetState::AT_RISK:             return "at_risk";
+        case TargetState::OCCLUDED:            return "occluded";
+        case TargetState::LOST:                return "lost";
+        case TargetState::CANDIDATE_REACQUIRE: return "candidate_reacquire";
+        case TargetState::REACQUIRED:          return "reacquired";
+    }
+    return "unknown";
+}
+
+// RFD 0011 U4: lifecycle state machine for one masklet, advanced once per frame
+// from the per-frame evidence. Hysteresis (degrade_count / occl_count) prevents
+// a single noisy frame from flipping the state. Thresholds are conservative
+// defaults; they live here (not magic numbers at the call site) per the Iris
+// "explicit over clever" rule.
+//   credible    : low-res box valid AND objectness positive (the U3 gate)
+//   mask_iou    : decoder predicted-IoU for the chosen mask (ml.last_score)
+//   motion_iou  : IoU(Kalman prediction, measured box) this frame (ml.last_motion_iou)
+//   area_ratio  : foreground fraction of the low-res grid
+//   warmup_done : the motion model has been seeded (predictions are meaningful)
+// "fail-lost, not fail-wrong": ambiguity degrades to AT_RISK / OCCLUDED, and
+// persistent loss becomes LOST. LOST is TERMINAL in this PR — there is no
+// appearance reacquire (U6/OSNet), and a bare re-detection is not a trustworthy
+// reacquire among visually similar subjects (kubrick / MOT17-09 evidence), so we
+// deliberately do not auto-recover from LOST here.
+static void sam3_update_target_state(sam3_masklet& ml, bool credible, float mask_iou,
+                                     float motion_iou, float area_ratio, bool warmup_done) {
+    // Tunables (RFD 0011 U4). Isolated here for a later calibration pass.
+    constexpr float IOU_OK     = 0.50f;  // predicted mask IoU above this is "good"
+    constexpr float MOTION_OK  = 0.30f;  // motion IoU above this is trajectory-consistent
+    constexpr int   T_LOST     = 12;     // consecutive degraded frames in AT_RISK -> LOST
+    constexpr int   T_OCCL     = 15;     // consecutive absent frames in OCCLUDED -> LOST
+
+    // Classify this frame's evidence. Motion is only gated once the filter is
+    // warmed (otherwise last_motion_iou is the 1.0 sentinel and always passes).
+    const bool good   = credible && mask_iou >= IOU_OK &&
+                        (!warmup_done || motion_iou >= MOTION_OK);
+    const bool weak   = credible && !good;  // a box exists but a signal degraded
+    const bool absent = !credible;          // no credible box this frame
+
+    const TargetState prev = ml.state;
+    switch (ml.state) {
+        case TargetState::TRACKED:
+            if (good)        { ml.degrade_count = 0; }
+            else if (weak)   { ml.state = TargetState::AT_RISK;  ml.degrade_count = 1; }
+            else             { ml.state = TargetState::OCCLUDED; ml.occl_count    = 1; }
+            break;
+        case TargetState::AT_RISK:
+            if (good)        { ml.state = TargetState::TRACKED;  ml.degrade_count = 0; }
+            else if (weak)   { if (++ml.degrade_count >= T_LOST) ml.state = TargetState::LOST; }
+            else             { ml.state = TargetState::OCCLUDED; ml.occl_count    = 1; }
+            break;
+        case TargetState::OCCLUDED:
+            if (good)        { ml.state = TargetState::TRACKED;  ml.occl_count = 0; ml.degrade_count = 0; }
+            else             { if (++ml.occl_count >= T_OCCL) ml.state = TargetState::LOST; }
+            break;
+        case TargetState::LOST:
+            // Terminal in this PR (no U6 reacquire). Stay LOST.
+            break;
+        default:
+            // CANDIDATE_REACQUIRE / REACQUIRED — reserved for U6, never entered here.
+            break;
+    }
+    if (ml.state != prev) {
+        fprintf(stderr, "[U4] inst %d: %s -> %s (mask_iou=%.2f motion=%.2f area=%.3f credible=%d)\n",
+                ml.instance_id, sam3_target_state_name(prev),
+                sam3_target_state_name(ml.state), mask_iou, motion_iou, area_ratio, (int)credible);
+    }
+}
+
 static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
     for (auto it = tracker.pending.begin(); it != tracker.pending.end();) {
         int age = frame_idx - it->first_frame;
@@ -12720,6 +12801,7 @@ sam3_result sam3_propagate_frame(
             // memory — keep an off-trajectory / low-confidence frame out of the
             // bank so it cannot anchor a future wrong-person lock.
             const bool credible = lrb[id].valid && (p2.obj_score > 0.0f);
+            credible_map[id] = credible;  // RFD 0011 U4: feed the lifecycle pass
             if (credible) {
                 std::array<float, 4> meas;
                 meas_from_lrb(lrb[id], meas);
@@ -12789,6 +12871,29 @@ sam3_result sam3_propagate_frame(
         sam3_update_tracker(tracker, fi);
     }
 
+    // ── RFD 0011 U4: advance each masklet's lifecycle state ──────────────
+    // Runs for every active + pending masklet, credible or not — an absent
+    // measurement drives TRACKED -> OCCLUDED -> LOST (fail-lost, not fail-wrong).
+    // Signals: credibility (U3 gate), predicted mask IoU (last_score), motion
+    // IoU (last_motion_iou, from U3's Kalman), low-res foreground area, and
+    // whether the motion filter was warmed. Counted under state_update_ms.
+    {
+        SAM3_TIME_SCOPE(state_update_ms);
+        auto advance_state = [&](sam3_masklet& ml) {
+            int id = ml.instance_id;
+            auto cit = credible_map.find(id);
+            bool credible = (cit != credible_map.end()) && cit->second;
+            auto lb = lrb.find(id);
+            float area = (lb != lrb.end()) ? lb->second.area_ratio : 0.0f;
+            auto kit = tracker.kf.find(id);
+            bool warm = (kit != tracker.kf.end()) && kit->second.init;
+            sam3_update_target_state(ml, credible, ml.last_score,
+                                     ml.last_motion_iou, area, warm);
+        };
+        for (auto& ml : tracker.masklets) advance_state(ml);
+        for (auto& ml : tracker.pending)  advance_state(ml);
+    }
+
     // ── Build result ─────────────────────────────────────────────────────
     // RFD 0011 U0: converting the per-instance masks into detection bboxes
     // (and post-processing the masks) is mask_to_bbox_ms.
@@ -12799,7 +12904,7 @@ sam3_result sam3_propagate_frame(
     // We MUST still emit the detection (with low-res box + score scalars) or the
     // bench would see an empty result.detections and report LOST. Mask pixels
     // are attached only when want_fullres built them (debug/overlay).
-    auto add_to_result = [&](int inst_id, float score) {
+    auto add_to_result = [&](int inst_id, float score, TargetState st) {
         auto lb = lrb.find(inst_id);
         // Skip instances with no valid low-res box (degenerate/empty mask) — the
         // old path likewise produced no box when there was no foreground.
@@ -12807,6 +12912,7 @@ sam3_result sam3_propagate_frame(
         sam3_detection det;
         det.instance_id = inst_id;
         det.score = score;
+        det.state = st;  // RFD 0011 U4: expose the lifecycle state on the detection
         det.box = {lb->second.x0, lb->second.y0, lb->second.x1, lb->second.y1};
         // The bench reads det.mask.obj_score / det.mask.iou_score scalars even
         // when mask pixels are absent — populate them from the propagation
@@ -12827,8 +12933,8 @@ sam3_result sam3_propagate_frame(
         result.detections.push_back(std::move(det));
     };
 
-    for (auto& ml : tracker.masklets) add_to_result(ml.instance_id, ml.last_score);
-    for (auto& ml : tracker.pending)  add_to_result(ml.instance_id, ml.last_score);
+    for (auto& ml : tracker.masklets) add_to_result(ml.instance_id, ml.last_score, ml.state);
+    for (auto& ml : tracker.pending)  add_to_result(ml.instance_id, ml.last_score, ml.state);
 
     // RFD 0011 U2: sam3_resolve_overlaps and the fill_holes/remove_sprinkles
     // postproc operate purely on full-res mask PIXELS (resolve_overlaps no-ops
