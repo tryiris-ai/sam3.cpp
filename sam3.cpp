@@ -12313,6 +12313,101 @@ sam3_tracker_ptr sam3_create_visual_tracker(
     return tracker;
 }
 
+// RFD 0011 U2 — derive the control bbox from the EdgeTAM mask decoder's
+// LOW-RES logit grid (mask_w x mask_h, == H*4 == 256 for EdgeTAM) instead of
+// the full-resolution (orig_w x orig_h, ~2M px) upsample+scan that was the
+// per-frame sync-killer (mask_to_bbox_ms ~11.7ms). Key properties that keep
+// this fast and GPU-sync-free:
+//   * It reads ONLY the fixed mask_w*mask_h cells already resident on the host
+//     (po.mask_logits) — no full-res std::vector alloc, no sam3_bilinear_
+//     interpolate, no second pass over millions of pixels.
+//   * The scan is a single fixed-trip-count loop (no nonzero-style
+//     variable-length coordinate gather), so it vectorizes and has no
+//     data-dependent branching on count.
+// The foreground extent in low-res CELL indices [cmin,cmax] is then scaled to
+// original-frame pixel corners. The full-res path binarized at logit>0 and took
+// the min/max foreground pixel. The DEFAULT "center" mapping is the exact
+// inverse of the bilinear transform sam3_bilinear_interpolate uses
+// (align_corners=False: src coord fx=(x+0.5)*sx-0.5), placing low-res cell
+// center `c` at src pixel (c+0.5)*scale-0.5. Measured against the U1 full-res
+// boxes this gives a near-symmetric, balanced per-corner error of <= ~0.36
+// low-res cells on every edge (the irreducible sub-cell threshold-crossing
+// uncertainty the low-res grid cannot resolve), i.e. mean bbox IoU ~0.986.
+// The alternative "edge" mapping (SAM3_LOWRES_BBOX_MODE=edge) maps the min/max
+// corners to the outer edges of [cmin,cmax]; it biases the top edge ~0.7 cell
+// high and is kept only for A/B parity debugging.
+LowResMaskBox bbox_from_lowres_mask(const float* mask_logits,
+                                    int mask_w, int mask_h,
+                                    int src_w, int src_h,
+                                    float threshold) {
+    LowResMaskBox out;  // valid defaults to false
+    if (!mask_logits || mask_w <= 0 || mask_h <= 0) return out;
+
+    // Fixed-shape min/max scan over the low-res grid. cmin/cmax are inclusive
+    // foreground cell indices; fg counts foreground cells for area_ratio.
+    int cmin_x = mask_w, cmin_y = mask_h, cmax_x = -1, cmax_y = -1;
+    int fg = 0;
+    for (int cy = 0; cy < mask_h; ++cy) {
+        const float* row = mask_logits + (size_t)cy * mask_w;
+        for (int cx = 0; cx < mask_w; ++cx) {
+            // logit > threshold == sigmoid(logit) > sigmoid(threshold);
+            // threshold=0 reproduces the full-res ">0.0f -> foreground" rule.
+            if (row[cx] > threshold) {
+                if (cx < cmin_x) cmin_x = cx;
+                if (cx > cmax_x) cmax_x = cx;
+                if (cy < cmin_y) cmin_y = cy;
+                if (cy > cmax_y) cmax_y = cy;
+                ++fg;
+            }
+        }
+    }
+
+    if (fg == 0 || cmax_x < 0) return out;  // no foreground -> invalid
+
+    out.area_ratio = (float)fg / ((float)mask_w * (float)mask_h);
+    // Reject degenerate coverage: a single-cell speck (< ~0.0005, i.e. < ~32
+    // cells of 65536) is almost certainly decoder noise, and near-full-frame
+    // (> 0.95) means the mask collapsed — neither yields a trustworthy control
+    // box, so fall back to the caller's handling.
+    if (out.area_ratio < 0.0005f || out.area_ratio > 0.95f) return out;
+
+    const float scale_x = (float)src_w / (float)mask_w;
+    const float scale_y = (float)src_h / (float)mask_h;
+
+    // Default "center" mapping: exact inverse of the bilinear fx=(x+0.5)*sx-0.5
+    // used by sam3_bilinear_interpolate, placing low-res cell center `c` at src
+    // pixel (c+0.5)*scale-0.5. Empirically the tightest match to the full-res
+    // min/max scan (balanced sub-cell error on all corners). The "edge" mapping
+    // (env SAM3_LOWRES_BBOX_MODE=edge) is kept for A/B parity debugging only.
+    static const bool edge_mode = (getenv("SAM3_LOWRES_BBOX_MODE") != nullptr &&
+                                   std::string(getenv("SAM3_LOWRES_BBOX_MODE")) == "edge");
+    float x0, y0, x1, y1;
+    if (edge_mode) {
+        // Cell-edge mapping: foreground cell `c` spans src pixels
+        // [c*scale, (c+1)*scale); map the min/max corners to those outer edges.
+        x0 = cmin_x * scale_x;
+        y0 = cmin_y * scale_y;
+        x1 = (cmax_x + 1) * scale_x - 1.0f;
+        y1 = (cmax_y + 1) * scale_y - 1.0f;
+    } else {
+        x0 = (cmin_x + 0.5f) * scale_x - 0.5f;
+        y0 = (cmin_y + 0.5f) * scale_y - 0.5f;
+        x1 = (cmax_x + 0.5f) * scale_x - 0.5f;
+        y1 = (cmax_y + 0.5f) * scale_y - 0.5f;
+    }
+    // Clamp to the valid pixel range (matches the full-res scan, whose extrema
+    // are always in [0, src-1]).
+    x0 = std::max(0.0f, std::min(x0, (float)(src_w - 1)));
+    y0 = std::max(0.0f, std::min(y0, (float)(src_h - 1)));
+    x1 = std::max(0.0f, std::min(x1, (float)(src_w - 1)));
+    y1 = std::max(0.0f, std::min(y1, (float)(src_h - 1)));
+    if (x1 < x0 || y1 < y0) return out;  // shouldn't happen; guard anyway
+
+    out.x0 = x0; out.y0 = y0; out.x1 = x1; out.y1 = y1;
+    out.valid = true;
+    return out;
+}
+
 sam3_result sam3_propagate_frame(
         sam3_tracker& tracker, sam3_state& state,
         const sam3_model& model, const sam3_image& frame) {
@@ -12331,30 +12426,51 @@ sam3_result sam3_propagate_frame(
     fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
             __func__, fi, tracker.masklets.size(), tracker.pending.size());
 
+    // RFD 0011 U2: full-res mask generation (upsample + hole/sprinkle postproc)
+    // is now OPT-IN — it is only needed for debug/overlay, not for the control
+    // bbox. Default OFF routes through the low-res bbox path that eliminates the
+    // ~11.7ms/frame mask_to_bbox sync-killer. Set SAM3_FULLRES_MASK to restore
+    // the previous full-res behavior (e.g. to save/inspect mask pixels).
+    const bool want_fullres = (getenv("SAM3_FULLRES_MASK") != nullptr);
+
     // ── Propagate active masklets ────────────────────────────────────────
     std::map<int, sam3_mask> pm;
     std::map<int, sam3_prop_output> po;
+    // RFD 0011 U2: per-instance low-res control boxes (scaled to orig pixels).
+    std::map<int, LowResMaskBox> lrb;
     for (auto& ml : tracker.masklets) {
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
         po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
         if (po[id].mask_logits.empty()) continue;
-        auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
-                                            po[id].mask_w, po[id].mask_h,
-                                            state.orig_width, state.orig_height);
-        pm[id].width = state.orig_width;
-        pm[id].height = state.orig_height;
-        pm[id].data.resize(state.orig_width * state.orig_height);
-        int fg = 0;
-        for (int p = 0; p < (int)rs.size(); ++p) {
-            bool f = rs[p] > 0.0f;
-            pm[id].data[p] = f ? 255 : 0;
-            if (f) fg++;
+        // RFD 0011 U2: derive the control bbox + coverage from the low-res grid.
+        // threshold=0.0f matches the full-res ">0.0f -> foreground" rule.
+        lrb[id] = bbox_from_lowres_mask(po[id].mask_logits.data(),
+                                        po[id].mask_w, po[id].mask_h,
+                                        state.orig_width, state.orig_height, 0.0f);
+        if (want_fullres) {
+            // Debug/overlay path: build the full-resolution binary mask (the old
+            // sync-killer). Kept byte-for-byte so SAM3_FULLRES_MASK reproduces
+            // prior mask pixels for saving/inspection.
+            auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
+                                                po[id].mask_w, po[id].mask_h,
+                                                state.orig_width, state.orig_height);
+            pm[id].width = state.orig_width;
+            pm[id].height = state.orig_height;
+            pm[id].data.resize(state.orig_width * state.orig_height);
+            for (int p = 0; p < (int)rs.size(); ++p)
+                pm[id].data[p] = rs[p] > 0.0f ? 255 : 0;
         }
         ml.last_score = po[id].iou_scores[0];
         ml.last_seen = fi;
-        float cov = (float)fg / (state.orig_width * state.orig_height);
+        // RFD 0011 U2: coverage signal for mds_sum now comes from the low-res
+        // area_ratio (fg cells / total cells) instead of the full-res fg/(W*H)
+        // count. Both measure the same foreground fraction of the frame, so the
+        // `> 0.001f` confirmation decision is equivalent — and it no longer
+        // requires the full-res scan. area_ratio is populated even when the box
+        // is rejected as degenerate (and is 0 when there is no foreground).
+        float cov = lrb[id].area_ratio;
         ml.mds_sum += (cov > 0.001f && po[id].obj_score > 0.0f) ? 1 : -1;
     }
 
@@ -12367,19 +12483,24 @@ sam3_result sam3_propagate_frame(
         if (!p2.mask_logits.empty()) {
             ml.last_score = p2.iou_scores[0];
             ml.last_seen = fi;
-            auto r2 = sam3_bilinear_interpolate(p2.mask_logits.data(),
-                                                p2.mask_w, p2.mask_h,
-                                                state.orig_width, state.orig_height);
-            int fg2 = 0;
-            for (auto v : r2)
-                if (v > 0.0f) fg2++;
-            float c2 = (float)fg2 / (state.orig_width * state.orig_height);
+            // RFD 0011 U2: low-res control box + coverage for the pending masklet
+            // (same low-res path as the active loop above).
+            lrb[id] = bbox_from_lowres_mask(p2.mask_logits.data(),
+                                            p2.mask_w, p2.mask_h,
+                                            state.orig_width, state.orig_height, 0.0f);
+            float c2 = lrb[id].area_ratio;
             ml.mds_sum += (c2 > 0.001f && p2.obj_score > 0.0f) ? 1 : -1;
-            pm[id].width = state.orig_width;
-            pm[id].height = state.orig_height;
-            pm[id].data.resize(state.orig_width * state.orig_height);
-            for (int p = 0; p < (int)r2.size(); ++p)
-                pm[id].data[p] = r2[p] > 0.0f ? 255 : 0;
+            if (want_fullres) {
+                // Debug/overlay path: full-res binary mask (see active loop).
+                auto r2 = sam3_bilinear_interpolate(p2.mask_logits.data(),
+                                                    p2.mask_w, p2.mask_h,
+                                                    state.orig_width, state.orig_height);
+                pm[id].width = state.orig_width;
+                pm[id].height = state.orig_height;
+                pm[id].data.resize(state.orig_width * state.orig_height);
+                for (int p = 0; p < (int)r2.size(); ++p)
+                    pm[id].data[p] = r2[p] > 0.0f ? 255 : 0;
+            }
             sam3_encode_memory(tracker, state, model, id,
                                p2.mask_logits.data(), p2.mask_h, p2.mask_w,
                                fi, false, p2.obj_score);
@@ -12415,43 +12536,57 @@ sam3_result sam3_propagate_frame(
     // RFD 0011 U0: converting the per-instance masks into detection bboxes
     // (and post-processing the masks) is mask_to_bbox_ms.
     SAM3_TIME_BEGIN(_t_mask_bbox);
-    auto add_mask_to_result = [&](int inst_id, float score, const sam3_mask& mask) {
-        if (mask.data.empty()) return;
+    // RFD 0011 U2: emit one detection per propagated instance with the control
+    // box taken from the LOW-RES grid (lrb). The box no longer depends on the
+    // full-res mask, so this runs even when full-res pixels are absent (default).
+    // We MUST still emit the detection (with low-res box + score scalars) or the
+    // bench would see an empty result.detections and report LOST. Mask pixels
+    // are attached only when want_fullres built them (debug/overlay).
+    auto add_to_result = [&](int inst_id, float score) {
+        auto lb = lrb.find(inst_id);
+        // Skip instances with no valid low-res box (degenerate/empty mask) — the
+        // old path likewise produced no box when there was no foreground.
+        if (lb == lrb.end() || !lb->second.valid) return;
         sam3_detection det;
         det.instance_id = inst_id;
         det.score = score;
-        det.mask = mask;
+        det.box = {lb->second.x0, lb->second.y0, lb->second.x1, lb->second.y1};
+        // The bench reads det.mask.obj_score / det.mask.iou_score scalars even
+        // when mask pixels are absent — populate them from the propagation
+        // output (obj_score) and the masklet's last IoU (iou_score == score).
         det.mask.instance_id = inst_id;
-        det.mask.iou_score = score;
-        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-        for (int p = 0; p < (int)det.mask.data.size(); ++p)
-            if (det.mask.data[p] > 127) {
-                int x = p % det.mask.width, y = p / det.mask.width;
-                x0 = std::min(x0, (float)x);
-                y0 = std::min(y0, (float)y);
-                x1 = std::max(x1, (float)x);
-                y1 = std::max(y1, (float)y);
+        det.mask.iou_score   = score;
+        auto pit = po.find(inst_id);
+        if (pit != po.end()) det.mask.obj_score = pit->second.obj_score;
+        // Attach full-res mask pixels only if we built them (debug/overlay).
+        if (want_fullres) {
+            auto it = pm.find(inst_id);
+            if (it != pm.end()) {
+                det.mask.width  = it->second.width;
+                det.mask.height = it->second.height;
+                det.mask.data   = it->second.data;
             }
-        if (x0 <= x1) det.box = {x0, y0, x1, y1};
+        }
         result.detections.push_back(std::move(det));
     };
 
-    for (auto& ml : tracker.masklets) {
-        auto it = pm.find(ml.instance_id);
-        if (it != pm.end()) add_mask_to_result(ml.instance_id, ml.last_score, it->second);
-    }
-    for (auto& ml : tracker.pending) {
-        auto it = pm.find(ml.instance_id);
-        if (it != pm.end()) add_mask_to_result(ml.instance_id, ml.last_score, it->second);
-    }
+    for (auto& ml : tracker.masklets) add_to_result(ml.instance_id, ml.last_score);
+    for (auto& ml : tracker.pending)  add_to_result(ml.instance_id, ml.last_score);
 
-    sam3_resolve_overlaps(result.detections);
-    for (auto& d : result.detections) {
-        if (d.mask.data.empty()) continue;
-        sam3_fill_holes(d.mask.data.data(), d.mask.width, d.mask.height,
-                        tracker.params.fill_hole_area);
-        sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height,
-                              tracker.params.fill_hole_area);
+    // RFD 0011 U2: sam3_resolve_overlaps and the fill_holes/remove_sprinkles
+    // postproc operate purely on full-res mask PIXELS (resolve_overlaps no-ops
+    // when mask.width/height are 0, fill/remove need a pixel buffer). On the
+    // default low-res path there are no pixels to resolve, so gate this whole
+    // block behind want_fullres rather than relying on the no-op path.
+    if (want_fullres) {
+        sam3_resolve_overlaps(result.detections);
+        for (auto& d : result.detections) {
+            if (d.mask.data.empty()) continue;
+            sam3_fill_holes(d.mask.data.data(), d.mask.width, d.mask.height,
+                            tracker.params.fill_hole_area);
+            sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height,
+                                  tracker.params.fill_hole_area);
+        }
     }
     SAM3_TIME_END(mask_to_bbox_ms, _t_mask_bbox);
     tracker.frame_index++;

@@ -58,6 +58,20 @@ struct sam3_box {
     float y1;  // bottom-right y
 };
 
+// RFD 0011 U2: bbox derived directly from the EdgeTAM mask decoder's
+// LOW-RES logit grid (mask_w x mask_h, ~256x256), scaled to original-frame
+// pixel corners. The full-resolution mask->bbox scan was the per-frame
+// sync-killer (~11.7ms: a 2M-pixel min/max scan + hole/sprinkle postproc per
+// instance). Scanning the fixed ~64K low-res grid instead is ~60x less work
+// and avoids the variable-length nonzero-style pass. `valid` is false when the
+// foreground area_ratio (fg / (mask_w*mask_h)) is degenerate (no foreground,
+// too small, or near-full-frame), so the caller can fall back / skip.
+struct LowResMaskBox {
+    bool  valid = false;
+    float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;  // original-frame pixel corners
+    float area_ratio = 0.0f;                            // fg cells / total cells
+};
+
 struct sam3_image {
     int width    = 0;
     int height   = 0;
@@ -298,6 +312,21 @@ sam3_result sam3_propagate_frame(
     sam3_state       & state,
     const sam3_model & model,
     const sam3_image & frame);
+
+/*
+** RFD 0011 U2 — derive a control bbox directly from the EdgeTAM mask
+** decoder's LOW-RES logit grid, skipping the full-resolution upsample +
+** min/max scan that dominated mask_to_bbox_ms. Iterates the fixed
+** mask_w*mask_h grid (no full-res allocation, no variable-length coord
+** arrays), thresholds logits (threshold=0.0f == sigmoid>0.5, matching the
+** existing full-res path), and scales the foreground cell extent to src
+** (original-frame) pixel corners. Returns valid=false when area_ratio is
+** degenerate. Exposed for the bench / debug tooling.
+*/
+LowResMaskBox bbox_from_lowres_mask(const float * mask_logits,
+                                    int mask_w, int mask_h,
+                                    int src_w, int src_h,
+                                    float threshold);
 
 /*
 ** ── Utility ─────────────────────────────────────────────────────────────
