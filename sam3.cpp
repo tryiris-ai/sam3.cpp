@@ -5027,60 +5027,92 @@ static bool edgetam_encode_image(sam3_state& state,
     // distinct from the graph build/alloc/compute measured above).
     {
         SAM3_TIME_SCOPE(state_update_ms);
-        // Free old state buffers
-        if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
-        if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
-        if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
-        if (state.ctx) { ggml_free(state.ctx); state.ctx = nullptr; }
 
-        // Create state context for persistent tensors
-        size_t state_ctx_size = ggml_tensor_overhead() * 32;
-        struct ggml_init_params sparams = {state_ctx_size, nullptr, true};
-        state.ctx = ggml_init(sparams);
-
-        for (int i = 0; i < n_fpn; ++i) {
-            auto* src = fpn_outs[i];
-            state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32,
-                                                     src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
-            char name[64];
-            snprintf(name, sizeof(name), "neck_trk_%d", i);
-            ggml_set_name(state.neck_trk[i], name);
-        }
-        for (int i = n_fpn; i < 4; ++i) {
-            state.neck_trk[i] = nullptr;
-        }
-
-        // Allocate state buffer
-        state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
-
-        // Copy FPN outputs to state
-        for (int i = 0; i < n_fpn; ++i) {
-            int64_t n_bytes = ggml_nbytes(state.neck_trk[i]);
-            std::vector<char> buf(n_bytes);
-            ggml_backend_tensor_get(fpn_outs[i], buf.data(), 0, n_bytes);
-            ggml_backend_tensor_set(state.neck_trk[i], buf.data(), 0, n_bytes);
+        // RFD 0011 U1 (state-buffer + PE reuse): the persistent state below is
+        // shape-CONSTANT during a tracking session — neck_trk / PE dims depend
+        // only on img_size (fixed mid-session), and the sinusoidal PE is purely
+        // positional, so it is IDENTICAL on every frame. The pre-U1 code freed
+        // and reallocated both Metal state buffers AND recomputed the PE every
+        // frame; U0 measured that at ~99ms — the single largest recoverable
+        // non-compute overhead in the frame (graph BUILD is already ~0). We now
+        // (re)allocate + recompute the PE only on the first frame after
+        // create/reset (or an img_size change) and, in steady state, copy just
+        // the changing FPN outputs into the already-allocated persistent
+        // tensors. sam3_free_state() still frees these on teardown.
+        bool reuse_state = (state.buffer != nullptr) && (state.pe_buf != nullptr);
+        if (reuse_state) {
+            for (int i = 0; i < n_fpn; ++i) {
+                auto* dst = state.neck_trk[i];
+                auto* src = fpn_outs[i];
+                if (!dst || dst->ne[0] != src->ne[0] || dst->ne[1] != src->ne[1] ||
+                    dst->ne[2] != src->ne[2] || dst->ne[3] != src->ne[3]) {
+                    reuse_state = false;
+                    break;
+                }
+            }
         }
 
-        // Compute sinusoidal PE for each FPN level
-        size_t pe_ctx_size = ggml_tensor_overhead() * 16;
-        struct ggml_init_params pe_params = {pe_ctx_size, nullptr, true};
-        state.pe_ctx = ggml_init(pe_params);
+        if (reuse_state) {
+            // Steady-state fast path: GPU-side copy of the new FPN outputs into
+            // the persistent neck_trk tensors (same Metal backend, no realloc,
+            // no CPU round-trip). The positional PE is already populated.
+            for (int i = 0; i < n_fpn; ++i) {
+                ggml_backend_tensor_copy(fpn_outs[i], state.neck_trk[i]);
+            }
+        } else {
+            // First frame after create/reset (or img_size change): (re)allocate
+            // the persistent state and compute the positional PE once.
+            if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+            if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+            if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+            if (state.ctx) { ggml_free(state.ctx); state.ctx = nullptr; }
 
-        for (int i = 0; i < n_fpn; ++i) {
-            int H = (int)state.neck_trk[i]->ne[2];
-            int W = (int)state.neck_trk[i]->ne[1];
-            state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32,
-                                                        hp.neck_dim, W, H, 1);
-            char name[64];
-            snprintf(name, sizeof(name), "neck_trk_pe_%d", i);
-            ggml_set_name(state.neck_trk_pe[i], name);
-        }
-        state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
-        for (int i = 0; i < n_fpn; ++i) {
-            int H = (int)state.neck_trk[i]->ne[2];
-            int W = (int)state.neck_trk[i]->ne[1];
-            auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
-            ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+            // Create state context for persistent tensors
+            size_t state_ctx_size = ggml_tensor_overhead() * 32;
+            struct ggml_init_params sparams = {state_ctx_size, nullptr, true};
+            state.ctx = ggml_init(sparams);
+
+            for (int i = 0; i < n_fpn; ++i) {
+                auto* src = fpn_outs[i];
+                state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32,
+                                                         src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+                char name[64];
+                snprintf(name, sizeof(name), "neck_trk_%d", i);
+                ggml_set_name(state.neck_trk[i], name);
+            }
+            for (int i = n_fpn; i < 4; ++i) {
+                state.neck_trk[i] = nullptr;
+            }
+
+            // Allocate state buffer
+            state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+
+            // Copy FPN outputs to state (GPU-side, same backend)
+            for (int i = 0; i < n_fpn; ++i) {
+                ggml_backend_tensor_copy(fpn_outs[i], state.neck_trk[i]);
+            }
+
+            // Compute sinusoidal PE for each FPN level (positional — computed once)
+            size_t pe_ctx_size = ggml_tensor_overhead() * 16;
+            struct ggml_init_params pe_params = {pe_ctx_size, nullptr, true};
+            state.pe_ctx = ggml_init(pe_params);
+
+            for (int i = 0; i < n_fpn; ++i) {
+                int H = (int)state.neck_trk[i]->ne[2];
+                int W = (int)state.neck_trk[i]->ne[1];
+                state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32,
+                                                            hp.neck_dim, W, H, 1);
+                char name[64];
+                snprintf(name, sizeof(name), "neck_trk_pe_%d", i);
+                ggml_set_name(state.neck_trk_pe[i], name);
+            }
+            state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+            for (int i = 0; i < n_fpn; ++i) {
+                int H = (int)state.neck_trk[i]->ne[2];
+                int W = (int)state.neck_trk[i]->ne[1];
+                auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
+                ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+            }
         }
     }
 
