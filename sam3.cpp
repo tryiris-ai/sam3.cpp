@@ -33,6 +33,7 @@
 
 /* C++ standard library */
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -1030,6 +1031,13 @@ struct sam3_masklet {
     // last predicted mask logits (owned by tracker ctx)
     struct ggml_tensor* mask_logits = nullptr;  // [1, 1, 288, 288]
     struct ggml_tensor* obj_ptr = nullptr;      // [1, 256]
+
+    // RFD 0011 U3: IoU(measured box, Kalman motion prediction) from the last
+    // propagated frame. 1.0 when no prediction was available (first frame /
+    // not-yet-initialized motion model). The U4 lifecycle state machine will
+    // consume this as the motion-consistency signal that distinguishes a real
+    // track from a wrong-person lock; U3 only populates it.
+    float last_motion_iou = 1.0f;  // RFD 0011 U3: IoU(measured box, Kalman prediction) last frame (for U4)
 };
 
 struct sam3_memory_slot {
@@ -1037,6 +1045,43 @@ struct sam3_memory_slot {
     struct ggml_tensor* spatial_pe     = nullptr;  // [64, 72, 72]
     int                 frame_index    = -1;
     bool                is_cond_frame  = false;
+    // RFD 0011 U3: per-slot bbox + quality recorded at the time this memory
+    // frame was written (normalized [0,1] center/size). Consumed by the
+    // motion-aware memory selector (sam3_select_memory_frames) to score each
+    // slot's trajectory consistency against the Kalman motion prediction.
+    float box_cx = 0.0f, box_cy = 0.0f, box_w = 0.0f, box_h = 0.0f;  // RFD 0011 U3: bbox at this memory frame (normalized)
+    float obj_score = 0.0f;   // RFD 0011 U3: objectness at this memory frame
+    float mask_iou  = 0.0f;   // RFD 0011 U3: predicted mask IoU at this memory frame
+    bool  is_anchor = false;  // RFD 0011 U3: high-quality long-term anchor (kept preferentially)
+};
+
+// RFD 0011 U3: constant-velocity Kalman, one independent 2-state [pos,vel]
+// filter per bbox coordinate (cx,cy,w,h), all normalized [0,1]. Provides (a) a
+// motion prediction to score memory frames by trajectory consistency (the
+// SAMURAI mechanism — prefer trajectory-consistent memory over
+// visually-sharp-but-off-trajectory frames), and (b) a motion-IoU signal
+// consumed by the U4 lifecycle state machine. Decoupled per-coordinate: each
+// coordinate is a standard 1-D CV filter with a 2x2 covariance, F=[[1,1],[0,1]]
+// (dt=1 frame), H=[1,0]. Not a toy — full predict/update with covariance
+// propagation, just scalarized per axis since the axes are treated independent.
+struct sam3_cv_kalman {
+    bool  init = false;
+    float x[4]   = {0,0,0,0};   // pos: cx,cy,w,h
+    float v[4]   = {0,0,0,0};   // vel
+    float Ppp[4] = {1,1,1,1}, Ppv[4] = {0,0,0,0}, Pvv[4] = {1,1,1,1};  // 2x2 cov per coord
+    static constexpr float Q = 1e-4f;  // process noise
+    static constexpr float R = 1e-2f;  // measurement noise
+    void seed(const float b[4]) { for(int i=0;i<4;++i){x[i]=b[i];v[i]=0;Ppp[i]=1;Ppv[i]=0;Pvv[i]=1;} init=true; }
+    void predict(float out[4]) {       // advance one frame (dt=1); F=[[1,1],[0,1]]
+        for(int i=0;i<4;++i){ x[i]+=v[i];
+            float ppp=Ppp[i]+2*Ppv[i]+Pvv[i]+Q, ppv=Ppv[i]+Pvv[i], pvv=Pvv[i]+Q;
+            Ppp[i]=ppp;Ppv[i]=ppv;Pvv[i]=pvv; out[i]=x[i]; } }
+    void update(const float z[4]) {
+        if(!init){seed(z);return;}
+        for(int i=0;i<4;++i){ float S=Ppp[i]+R, Kp=Ppp[i]/S, Kv=Ppv[i]/S, y=z[i]-x[i];
+            x[i]+=Kp*y; v[i]+=Kv*y;
+            float ppp=Ppp[i]*(1-Kp), ppv=Ppv[i]*(1-Kp), pvv=Pvv[i]-Kv*Ppv[i];
+            Ppp[i]=ppp;Ppv[i]=ppv;Pvv[i]=pvv; } }
 };
 
 struct sam3_tracker {
@@ -1049,6 +1094,12 @@ struct sam3_tracker {
 
     std::map<int, std::vector<sam3_memory_slot>> mem_banks;
     std::map<int, std::vector<std::pair<int, struct ggml_tensor*>>> ptr_banks;
+
+    // RFD 0011 U3: per-instance constant-velocity motion model. Keyed by
+    // instance_id, parallel to mem_banks/ptr_banks. Cleared on tracker reset and
+    // erased per-instance on eviction (sam3_update_tracker) so motion state never
+    // leaks across clips or across a re-used instance id.
+    std::map<int, sam3_cv_kalman> kf;  // RFD 0011 U3: per-instance motion model
 
     struct ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
@@ -9570,27 +9621,107 @@ static void sam3_extract_obj_ptr_cpu(
 ** Tracker infrastructure (Phase 7, Step 7.4)
 *****************************************************************************/
 
-// Select memory frames for propagation (most recent + evenly spaced).
+// RFD 0011 U3: IoU between two boxes given as (cx,cy,w,h) in normalized [0,1].
+// Converts to corner form and computes standard intersection-over-union. Used
+// by the motion-aware memory selector to score each slot's stored bbox against
+// the Kalman motion prediction.
+static float iou_cxcywh(const float a[4], const float b[4]) {
+    const float ax0 = a[0] - a[2] * 0.5f, ay0 = a[1] - a[3] * 0.5f;
+    const float ax1 = a[0] + a[2] * 0.5f, ay1 = a[1] + a[3] * 0.5f;
+    const float bx0 = b[0] - b[2] * 0.5f, by0 = b[1] - b[3] * 0.5f;
+    const float bx1 = b[0] + b[2] * 0.5f, by1 = b[1] + b[3] * 0.5f;
+    const float ix0 = std::max(ax0, bx0), iy0 = std::max(ay0, by0);
+    const float ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
+    const float inter = std::max(0.0f, ix1 - ix0) * std::max(0.0f, iy1 - iy0);
+    const float area_a = std::max(0.0f, ax1 - ax0) * std::max(0.0f, ay1 - ay0);
+    const float area_b = std::max(0.0f, bx1 - bx0) * std::max(0.0f, by1 - by0);
+    const float uni = area_a + area_b - inter;
+    return (uni > 0.0f) ? inter / uni : 0.0f;
+}
+
+// RFD 0011 U3: motion-aware memory-frame selection (SAMURAI, "Level 1").
+// Replaces the previous purely-uniform temporal sampling. When a Kalman motion
+// prediction `pred` (cx,cy,w,h normalized) is supplied, intermediate memory
+// frames are scored by how trajectory-consistent their stored bbox is with the
+// prediction (plus quality/recency terms), and the top-scoring ones are kept.
+// This prefers memory that lies on the object's predicted path over frames that
+// are visually sharp but spatially off-trajectory — the mechanism that reduces
+// wrong-person locks in crowds.
+//
+// This only changes WHICH CPU-side slots feed the memory-attention graph; the
+// graph itself is rebuilt per frame and adapts to the returned set size exactly
+// as it does for the uniform path. The conditioning/seed frame (index 0) and
+// the most-recent frame (index n-1) are ALWAYS kept, matching the uniform path,
+// so temporal-position assignment downstream is unchanged in shape.
 static std::vector<int> sam3_select_memory_frames(
     const std::vector<sam3_memory_slot>& bank,
-    int max_slots) {
+    int max_slots,
+    const float* pred /* cx,cy,w,h, or nullptr */) {
     if ((int)bank.size() <= max_slots) {
         std::vector<int> all(bank.size());
         for (int i = 0; i < (int)bank.size(); ++i) all[i] = i;
         return all;
     }
+
+    // Fallback: no motion estimate yet (e.g. very first hold frame, before the
+    // filter has been updated). Reproduce the original uniform sampling exactly
+    // so behavior is identical until motion information exists.
+    if (pred == nullptr) {
+        std::vector<int> selected;
+        selected.push_back(0);
+        selected.push_back((int)bank.size() - 1);
+        int remaining = max_slots - 2;
+        if (remaining > 0) {
+            float step = (float)(bank.size() - 2) / (remaining + 1);
+            for (int i = 0; i < remaining; ++i) {
+                int idx = 1 + (int)((i + 1) * step);
+                idx = std::min(idx, (int)bank.size() - 2);
+                selected.push_back(idx);
+            }
+        }
+        std::sort(selected.begin(), selected.end());
+        selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+        return selected;
+    }
+
+    // Motion-aware path. Always keep the seed frame (0) and the most recent
+    // frame (n-1); score every interior slot and keep the top (max_slots-2).
+    const int n = (int)bank.size();
     std::vector<int> selected;
     selected.push_back(0);
-    selected.push_back((int)bank.size() - 1);
+    selected.push_back(n - 1);
+
     int remaining = max_slots - 2;
     if (remaining > 0) {
-        float step = (float)(bank.size() - 2) / (remaining + 1);
-        for (int i = 0; i < remaining; ++i) {
-            int idx = 1 + (int)((i + 1) * step);
-            idx = std::min(idx, (int)bank.size() - 2);
-            selected.push_back(idx);
+        struct Scored { int idx; float score; };
+        std::vector<Scored> cand;
+        cand.reserve(n - 2);
+        for (int i = 1; i < n - 1; ++i) {
+            const sam3_memory_slot& s = bank[i];
+            const float box[4] = { s.box_cx, s.box_cy, s.box_w, s.box_h };
+            const float motion = iou_cxcywh(box, pred);
+            const float recency = (n > 1) ? (float)i / (float)(n - 1) : 0.0f;
+            // Weighted blend: trajectory consistency dominates (SAMURAI), then
+            // decode quality (mask_iou, objectness), then recency, with an
+            // anchor bonus so confirmed high-quality long-term frames survive.
+            float score = 0.4f * motion
+                        + 0.3f * s.mask_iou
+                        + 0.2f * s.obj_score
+                        + 0.1f * recency
+                        + (s.is_anchor ? 0.15f : 0.0f);
+            cand.push_back({ i, score });
         }
+        // Highest score first; tie-break on more-recent index for determinism.
+        std::sort(cand.begin(), cand.end(), [](const Scored& a, const Scored& b) {
+            if (a.score != b.score) return a.score > b.score;
+            return a.idx > b.idx;
+        });
+        const int take = std::min(remaining, (int)cand.size());
+        for (int k = 0; k < take; ++k) selected.push_back(cand[k].idx);
     }
+
+    // Return sorted unique indices (frame order) so the downstream temporal
+    // position assignment (n_sel - s) stays monotonic, exactly as for uniform.
     std::sort(selected.begin(), selected.end());
     selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
     return selected;
@@ -11323,14 +11454,18 @@ static sam3_prop_output sam3_propagate_single(
     sam3_tracker& tracker, sam3_state& state, const sam3_model& model,
     const sam3_masklet& masklet,
     const std::vector<sam3_memory_slot>& mem_bank,
-    const std::vector<std::pair<int, struct ggml_tensor*>>& ptr_bank) {
+    const std::vector<std::pair<int, struct ggml_tensor*>>& ptr_bank,
+    const float* motion_pred /* RFD 0011 U3: cx,cy,w,h Kalman prediction, or nullptr */) {
     sam3_prop_output output = {};
     const auto& hp = model.hparams;
     const int D = hp.neck_dim, MD = hp.mem_out_dim;
     const int H = sam3_eff_feat_size(state, hp);
     const int N = H * H;
 
-    auto sel = sam3_select_memory_frames(mem_bank, hp.num_maskmem);
+    // RFD 0011 U3: motion-aware memory selection. motion_pred is the per-instance
+    // constant-velocity prediction supplied by sam3_propagate_frame; when null
+    // (no motion model yet) the selector falls back to uniform sampling.
+    auto sel = sam3_select_memory_frames(mem_bank, hp.num_maskmem, motion_pred);
     if (sel.empty()) return output;
 
     // ── Build prompt and prompt_pos via sam3_build_prompt_and_pos ─────────
@@ -11656,6 +11791,10 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
             tracker.masklets.push_back(std::move(*it));
             it = tracker.pending.erase(it);
         } else if (age >= tracker.params.hotstart_delay) {
+            // RFD 0011 U3: a pending masklet that failed to confirm is dropped —
+            // erase its motion model too so a recycled instance id can't inherit
+            // a stale Kalman state.
+            tracker.kf.erase(it->instance_id);
             it = tracker.pending.erase(it);
         } else
             ++it;
@@ -11664,10 +11803,26 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
         if (frame_idx - it->last_seen > tracker.params.max_keep_alive) {
             tracker.mem_banks.erase(it->instance_id);
             tracker.ptr_banks.erase(it->instance_id);
+            // RFD 0011 U3: evict the per-instance motion model alongside its
+            // memory/pointer banks so motion state does not leak across tracks.
+            tracker.kf.erase(it->instance_id);
             it = tracker.masklets.erase(it);
         } else
             ++it;
     }
+}
+
+// RFD 0011 U3: stored memory-pool capacity. Previously the bank was a fixed
+// FIFO ring of exactly num_maskmem slots, which meant sam3_select_memory_frames
+// never had more than num_maskmem candidates and so could never SUBSET them —
+// the motion-aware selector was effectively dead on EdgeTAM. We now keep a
+// larger pool (2x num_maskmem) and let sam3_select_memory_frames pick the
+// num_maskmem most trajectory-consistent slots for attention each frame. This
+// is the SAMURAI design: a memory pool + per-frame motion-aware selection. The
+// attention graph is unchanged — it still receives <= num_maskmem slots (the
+// selector caps its output), so tensor shapes / tpos indexing are untouched.
+static inline int sam3_mem_pool_cap(int num_maskmem) {
+    return num_maskmem > 0 ? num_maskmem * 2 : 1;
 }
 
 static bool sam3_encode_memory(
@@ -11840,7 +11995,10 @@ static bool sam3_encode_memory(
         slot.is_cond_frame = is_cond;
         auto& bk = tracker.mem_banks[inst_id];
         bk.push_back(slot);
-        while ((int)bk.size() > hp.num_maskmem) {
+        // RFD 0011 U3: trim to the memory POOL cap (>= num_maskmem) rather than
+        // exactly num_maskmem, so sam3_select_memory_frames has a real choice of
+        // motion-consistent slots. Still drop the oldest non-cond slot first.
+        while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
             bool removed = false;
             for (auto it = bk.begin(); it != bk.end(); ++it)
                 if (!it->is_cond_frame) {
@@ -11882,7 +12040,10 @@ static bool sam3_encode_memory(
     slot.is_cond_frame = is_cond;
     auto& bk = tracker.mem_banks[inst_id];
     bk.push_back(slot);
-    while ((int)bk.size() > hp.num_maskmem) {
+    // RFD 0011 U3: trim to the memory POOL cap (see perceiver path above and
+    // sam3_mem_pool_cap). Selection of the attended num_maskmem subset is the
+    // motion-aware sam3_select_memory_frames; eviction here only bounds storage.
+    while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
         bool removed = false;
         for (auto it = bk.begin(); it != bk.end(); ++it)
             if (!it->is_cond_frame) {
@@ -11952,7 +12113,10 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        // RFD 0011 U3: the PCS track_frame path keeps uniform memory sampling
+        // (nullptr motion_pred) — motion-aware selection is wired into the
+        // visual-only sam3_propagate_frame hold loop only (U3 scope).
+        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id], nullptr);
         if (po[id].mask_logits.empty()) continue;
         auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
                                             po[id].mask_w, po[id].mask_h, state.orig_width, state.orig_height);
@@ -11974,7 +12138,8 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        // RFD 0011 U3: PCS path keeps uniform sampling (see active loop above).
+        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id], nullptr);
         if (!p2.mask_logits.empty()) {
             ml.last_score = p2.iou_scores[0];
             ml.last_seen = fi;
@@ -12280,6 +12445,9 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     tracker.pending.clear();
     tracker.mem_banks.clear();
     tracker.ptr_banks.clear();
+    // RFD 0011 U3: drop all per-instance motion models so Kalman state never
+    // leaks across clips (matching the mem_banks/ptr_banks reset above).
+    tracker.kf.clear();
     for (auto* b : tracker.owned_buffers)
         if (b) ggml_backend_buffer_free(b);
     tracker.owned_buffers.clear();
@@ -12438,11 +12606,34 @@ sam3_result sam3_propagate_frame(
     std::map<int, sam3_prop_output> po;
     // RFD 0011 U2: per-instance low-res control boxes (scaled to orig pixels).
     std::map<int, LowResMaskBox> lrb;
+    // RFD 0011 U3: per-instance normalized measured box (cx,cy,w,h) and a
+    // credibility flag, carried from the propagate loops into the memory-encode
+    // loop so the new slot's metadata (and the credibility-gated memory write)
+    // use the box that was actually measured this frame.
+    std::map<int, std::array<float, 4>> meas_map;
+    std::map<int, bool> credible_map;
+    // RFD 0011 U3: convert a valid low-res box (orig-pixel corners) to a
+    // normalized cx,cy,w,h measurement for the Kalman filter / slot metadata.
+    auto meas_from_lrb = [&](const LowResMaskBox& b, std::array<float, 4>& out) {
+        const float ow = (float)state.orig_width, oh = (float)state.orig_height;
+        out[0] = ((b.x0 + b.x1) * 0.5f) / ow;  // cx
+        out[1] = ((b.y0 + b.y1) * 0.5f) / oh;  // cy
+        out[2] = (b.x1 - b.x0) / ow;           // w
+        out[3] = (b.y1 - b.y0) / oh;           // h
+    };
     for (auto& ml : tracker.masklets) {
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        // RFD 0011 U3: advance this instance's motion model one frame BEFORE
+        // propagation so the memory selector can prefer trajectory-consistent
+        // memory. If the filter is not yet initialized, pass nullptr (uniform).
+        sam3_cv_kalman& kf = tracker.kf[id];
+        float pred[4];
+        bool have = kf.init;
+        if (have) kf.predict(pred);
+        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second,
+                                       tracker.ptr_banks[id], have ? pred : nullptr);
         if (po[id].mask_logits.empty()) continue;
         // RFD 0011 U2: derive the control bbox + coverage from the low-res grid.
         // threshold=0.0f matches the full-res ">0.0f -> foreground" rule.
@@ -12472,6 +12663,23 @@ sam3_result sam3_propagate_frame(
         // is rejected as degenerate (and is 0 when there is no foreground).
         float cov = lrb[id].area_ratio;
         ml.mds_sum += (cov > 0.001f && po[id].obj_score > 0.0f) ? 1 : -1;
+
+        // RFD 0011 U3: a detection is credible iff the low-res box is valid AND
+        // objectness is positive. Only a credible measurement is allowed to
+        // advance the motion model and write memory — this is the proto for
+        // "don't drift the Kalman / don't poison the memory bank when the track
+        // is effectively lost" (U4 will formalize this into explicit states).
+        const bool credible = lrb[id].valid && (po[id].obj_score > 0.0f);
+        credible_map[id] = credible;
+        if (credible) {
+            std::array<float, 4> meas;
+            meas_from_lrb(lrb[id], meas);
+            meas_map[id] = meas;
+            // Motion-consistency signal for U4: IoU(prediction, measurement).
+            // 1.0 when there was no prediction this frame (filter just seeded).
+            ml.last_motion_iou = have ? iou_cxcywh(pred, meas.data()) : 1.0f;
+            kf.update(meas.data());
+        }
     }
 
     // ── Propagate pending masklets ───────────────────────────────────────
@@ -12479,7 +12687,13 @@ sam3_result sam3_propagate_frame(
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        // RFD 0011 U3: same predict-before-propagate as the active loop.
+        sam3_cv_kalman& kf = tracker.kf[id];
+        float pred[4];
+        bool have = kf.init;
+        if (have) kf.predict(pred);
+        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second,
+                                        tracker.ptr_banks[id], have ? pred : nullptr);
         if (!p2.mask_logits.empty()) {
             ml.last_score = p2.iou_scores[0];
             ml.last_seen = fi;
@@ -12501,12 +12715,36 @@ sam3_result sam3_propagate_frame(
                 for (int p = 0; p < (int)r2.size(); ++p)
                     pm[id].data[p] = r2[p] > 0.0f ? 255 : 0;
             }
-            sam3_encode_memory(tracker, state, model, id,
-                               p2.mask_logits.data(), p2.mask_h, p2.mask_w,
-                               fi, false, p2.obj_score);
-            std::vector<float> op(D);
-            sam3_extract_obj_ptr_cpu(model, p2.sam_token.data(), p2.obj_score, op.data());
-            sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
+            // RFD 0011 U3: credibility gate (valid box + positive objectness).
+            // When not credible, neither advance the motion model nor write
+            // memory — keep an off-trajectory / low-confidence frame out of the
+            // bank so it cannot anchor a future wrong-person lock.
+            const bool credible = lrb[id].valid && (p2.obj_score > 0.0f);
+            if (credible) {
+                std::array<float, 4> meas;
+                meas_from_lrb(lrb[id], meas);
+                ml.last_motion_iou = have ? iou_cxcywh(pred, meas.data()) : 1.0f;
+                kf.update(meas.data());
+                sam3_encode_memory(tracker, state, model, id,
+                                   p2.mask_logits.data(), p2.mask_h, p2.mask_w,
+                                   fi, false, p2.obj_score);
+                // RFD 0011 U3: stamp the just-pushed slot with this frame's box
+                // + quality so the motion selector can score it next time. A
+                // slot is an anchor when both objectness and predicted mask IoU
+                // are high — such frames are kept preferentially across time.
+                auto& bk = tracker.mem_banks[id];
+                if (!bk.empty()) {
+                    sam3_memory_slot& slot = bk.back();
+                    slot.box_cx = meas[0]; slot.box_cy = meas[1];
+                    slot.box_w  = meas[2]; slot.box_h  = meas[3];
+                    slot.obj_score = p2.obj_score;
+                    slot.mask_iou  = p2.iou_scores[0];
+                    slot.is_anchor = (p2.obj_score > 0.9f && p2.iou_scores[0] > 0.8f);
+                }
+                std::vector<float> op(D);
+                sam3_extract_obj_ptr_cpu(model, p2.sam_token.data(), p2.obj_score, op.data());
+                sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
+            }
         }
     }
 
@@ -12515,9 +12753,28 @@ sam3_result sam3_propagate_frame(
         int id = ml.instance_id;
         auto it = po.find(id);
         if (it == po.end() || it->second.mask_logits.empty()) continue;
+        // RFD 0011 U3: only write memory for a credible detection (valid box +
+        // positive objectness, decided in the propagate loop above). The motion
+        // model was already advanced there; here we just gate the memory write
+        // and stamp the new slot's bbox/quality metadata for future selection.
+        auto cit = credible_map.find(id);
+        if (cit == credible_map.end() || !cit->second) continue;
         sam3_encode_memory(tracker, state, model, id,
                            it->second.mask_logits.data(), it->second.mask_h,
                            it->second.mask_w, fi, false, it->second.obj_score);
+        // RFD 0011 U3: record this memory frame's box + quality on the slot that
+        // sam3_encode_memory just pushed, so the motion-aware selector can score
+        // its trajectory consistency on subsequent frames.
+        auto mit = meas_map.find(id);
+        auto& bk = tracker.mem_banks[id];
+        if (mit != meas_map.end() && !bk.empty()) {
+            sam3_memory_slot& slot = bk.back();
+            slot.box_cx = mit->second[0]; slot.box_cy = mit->second[1];
+            slot.box_w  = mit->second[2]; slot.box_h  = mit->second[3];
+            slot.obj_score = it->second.obj_score;
+            slot.mask_iou  = it->second.iou_scores[0];
+            slot.is_anchor = (it->second.obj_score > 0.9f && it->second.iou_scores[0] > 0.8f);
+        }
         std::vector<float> op(D);
         sam3_extract_obj_ptr_cpu(model, it->second.sam_token.data(),
                                  it->second.obj_score, op.data());
