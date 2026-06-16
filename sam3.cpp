@@ -57,6 +57,90 @@
 
 
 /*****************************************************************************
+** Per-frame "hold" timing instrumentation (RFD 0011 U0)
+**
+** Fine-grained build / alloc / compute split timers for the EdgeTAM video
+** tracker's steady-state loop. See the HoldFrameTiming doc comment in sam3.h
+** for the rationale: RFD 0011 unit U1 removes the per-frame graph rebuild and
+** asserts "build_ms + alloc_ms ≈ 0" in steady state, which is only verifiable
+** if build, alloc, and compute are measured as DISTINCT numbers here.
+**
+** Everything is gated behind -DSAM3_TIMING so the timers are strictly
+** zero-overhead in the default sam3 library build: when SAM3_TIMING is
+** undefined the SAM3_TIME_SCOPE macro expands to nothing and the public
+** accessor returns an all-zero struct. The RFD-0011 bench links a sam3 built
+** WITH SAM3_TIMING (see CMakeLists.txt option SAM3_TIMING).
+*****************************************************************************/
+
+#ifdef SAM3_TIMING
+
+// Thread-local accumulator for the frame currently being processed. Fields are
+// accumulated (+=) so that stages invoked once-per-instance-per-frame
+// (propagation, memory encode) sum correctly across instances within a frame.
+// sam3_take_frame_timing() reads and clears this.
+static thread_local HoldFrameTiming g_sam3_frame_timing;
+
+// RAII scoped timer: on destruction, adds the elapsed wall-clock milliseconds
+// since construction into the target field of the thread-local accumulator.
+// Using high_resolution_clock per the U0 spec.
+struct Sam3ScopedTimer {
+    double* target;
+    std::chrono::high_resolution_clock::time_point t0;
+    explicit Sam3ScopedTimer(double* field)
+        : target(field), t0(std::chrono::high_resolution_clock::now()) {}
+    ~Sam3ScopedTimer() {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        *target += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+};
+
+// Time the enclosing C++ scope into g_sam3_frame_timing.<field>. The unique
+// name avoids shadowing when two timers coexist in nested scopes.
+#define SAM3_TIME_SCOPE(field) \
+    Sam3ScopedTimer _sam3_timer_##field(&g_sam3_frame_timing.field)
+
+// Manually add a measured millisecond delta into a timing field. Used where a
+// scope-based timer does not fit (e.g. timing a region that ends mid-function
+// before other timed regions begin).
+#define SAM3_TIME_ADD(field, ms) \
+    do { g_sam3_frame_timing.field += (ms); } while (0)
+
+// Begin/end a timed region using an explicit named timepoint. Preferred over
+// SAM3_TIME_SCOPE for regions that contain early returns or whose allocated
+// objects must outlive the timed region (e.g. the graph/allocator built in the
+// propagation and memory-encode functions). SAM3_TIME_BEGIN declares a local
+// time_point; SAM3_TIME_END accumulates the elapsed ms into <field>.
+#define SAM3_TIME_BEGIN(var) \
+    auto var = std::chrono::high_resolution_clock::now()
+#define SAM3_TIME_END(field, var) \
+    do { auto _e = std::chrono::high_resolution_clock::now(); \
+         g_sam3_frame_timing.field += \
+             std::chrono::duration<double, std::milli>(_e - (var)).count(); } while (0)
+
+#else  // !SAM3_TIMING — zero-overhead no-ops
+
+#define SAM3_TIME_SCOPE(field) do {} while (0)
+#define SAM3_TIME_ADD(field, ms) do {} while (0)
+#define SAM3_TIME_BEGIN(var) do {} while (0)
+#define SAM3_TIME_END(field, var) do {} while (0)
+
+#endif  // SAM3_TIMING
+
+// Public accessor: return the accumulated timing for the most recent frame and
+// reset the accumulator. Returns zeros when built without SAM3_TIMING. Declared
+// in sam3.h for the RFD-0011 bench; defined here next to the instrumentation.
+HoldFrameTiming sam3_take_frame_timing() {
+#ifdef SAM3_TIMING
+    HoldFrameTiming out = g_sam3_frame_timing;
+    g_sam3_frame_timing = HoldFrameTiming{};
+    return out;
+#else
+    return HoldFrameTiming{};
+#endif
+}
+
+
+/*****************************************************************************
 ** Constants
 *****************************************************************************/
 
@@ -4844,129 +4928,160 @@ static bool edgetam_encode_image(sam3_state& state,
     state.orig_height = image.height;
 
     // ── Preprocess (same ImageNet normalization as SAM2) ─────────────────
-    auto img_data = sam2_preprocess_image(image, img_size);
+    // RFD 0011 U0: preprocess timed separately from the graph build/alloc/compute.
+    std::vector<float> img_data;
+    {
+        SAM3_TIME_SCOPE(preprocess_ms);
+        img_data = sam2_preprocess_image(image, img_size);
+    }
 
     // ── Build graph ──────────────────────────────────────────────────────
-    const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
-    struct ggml_init_params gparams = {
-        /*.mem_size   =*/buf_size,
-        /*.mem_buffer =*/nullptr,
-        /*.no_alloc   =*/true,
-    };
-    auto* ctx0 = ggml_init(gparams);
-    if (!ctx0) {
-        fprintf(stderr, "%s: failed to init compute context\n", __func__);
-        return false;
-    }
-
-    auto* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
-    ggml_set_name(inp, "input_image");
-    ggml_set_input(inp);
-
-    // Build RepViT backbone
-    struct ggml_tensor* stage_outs[4] = {};
-    edgetam_build_repvit_graph(ctx0, inp, model, stage_outs);
-
-    // Build EdgeTAM FPN neck (optimized: mul_mat for 1×1, unified [W,H,C] layout)
-    struct ggml_tensor* fpn_outs[4] = {};
-    edgetam_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
-
-    // Mark FPN outputs
+    // RFD 0011 U0: graph CONSTRUCTION region (image_encoder_build_ms). U1 will
+    // build this graph once and reuse it, driving build_ms toward 0; that is
+    // only measurable because build is timed apart from alloc/compute below.
+    auto* graph = (struct ggml_cgraph*)nullptr;
+    struct ggml_context* ctx0 = nullptr;
+    struct ggml_tensor* inp = nullptr;
     int n_fpn = 4 - hp.scalp;
-    for (int i = 0; i < n_fpn; ++i) {
-        char name[64];
-        snprintf(name, sizeof(name), "fpn_out_%d", i);
-        ggml_set_name(fpn_outs[i], name);
-        ggml_set_output(fpn_outs[i]);
+    struct ggml_tensor* fpn_outs[4] = {};
+    {
+        SAM3_TIME_SCOPE(image_encoder_build_ms);
+        const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gparams = {
+            /*.mem_size   =*/buf_size,
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        ctx0 = ggml_init(gparams);
+        if (!ctx0) {
+            fprintf(stderr, "%s: failed to init compute context\n", __func__);
+            return false;
+        }
+
+        inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
+        ggml_set_name(inp, "input_image");
+        ggml_set_input(inp);
+
+        // Build RepViT backbone
+        struct ggml_tensor* stage_outs[4] = {};
+        edgetam_build_repvit_graph(ctx0, inp, model, stage_outs);
+
+        // Build EdgeTAM FPN neck (optimized: mul_mat for 1×1, unified [W,H,C] layout)
+        edgetam_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
+
+        // Mark FPN outputs
+        for (int i = 0; i < n_fpn; ++i) {
+            char name[64];
+            snprintf(name, sizeof(name), "fpn_out_%d", i);
+            ggml_set_name(fpn_outs[i], name);
+            ggml_set_output(fpn_outs[i]);
+        }
+
+        // Build computation graph
+        graph = ggml_new_graph_custom(ctx0, 32768, false);
+        for (int i = 0; i < n_fpn; ++i) {
+            ggml_build_forward_expand(graph, fpn_outs[i]);
+        }
     }
 
-    // Build computation graph
-    auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
-    for (int i = 0; i < n_fpn; ++i) {
-        ggml_build_forward_expand(graph, fpn_outs[i]);
-    }
-
-    // ── Allocate + compute ───────────────────────────────────────────────
+    // ── Allocate ─────────────────────────────────────────────────────────
+    // RFD 0011 U0: gallocr reserve+alloc region (image_encoder_alloc_ms),
+    // separate from build and compute. U1 reuses a pre-reserved allocator here.
     auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-    if (!ggml_gallocr_reserve(galloc, graph)) {
-        fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
-        return false;
-    }
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
-        fprintf(stderr, "%s: failed to alloc graph\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
-        return false;
+    {
+        SAM3_TIME_SCOPE(image_encoder_alloc_ms);
+        if (!ggml_gallocr_reserve(galloc, graph)) {
+            fprintf(stderr, "%s: failed to reserve graph memory\n", __func__);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
+        if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+            fprintf(stderr, "%s: failed to alloc graph\n", __func__);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
     }
 
     // Set input image
     ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
 
-    // Compute
-    if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
-        fprintf(stderr, "%s: graph compute failed\n", __func__);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
-        return false;
+    // ── Compute ──────────────────────────────────────────────────────────
+    // RFD 0011 U0: backend compute region (image_encoder_compute_ms). This is
+    // the irreducible work U1 cannot remove — only the build+alloc around it.
+    {
+        SAM3_TIME_SCOPE(image_encoder_compute_ms);
+        if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
+            fprintf(stderr, "%s: graph compute failed\n", __func__);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return false;
+        }
     }
 
     // ── Copy results to state ────────────────────────────────────────────
-    // Free old state buffers
-    if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
-    if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
-    if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
-    if (state.ctx) { ggml_free(state.ctx); state.ctx = nullptr; }
+    // RFD 0011 U0: copying FPN outputs into persistent state tensors and
+    // computing the per-level sinusoidal PE is post-compute bookkeeping, timed
+    // as state_update_ms (it is part of the encoder's per-frame state refresh,
+    // distinct from the graph build/alloc/compute measured above).
+    {
+        SAM3_TIME_SCOPE(state_update_ms);
+        // Free old state buffers
+        if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+        if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+        if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+        if (state.ctx) { ggml_free(state.ctx); state.ctx = nullptr; }
 
-    // Create state context for persistent tensors
-    size_t state_ctx_size = ggml_tensor_overhead() * 32;
-    struct ggml_init_params sparams = {state_ctx_size, nullptr, true};
-    state.ctx = ggml_init(sparams);
+        // Create state context for persistent tensors
+        size_t state_ctx_size = ggml_tensor_overhead() * 32;
+        struct ggml_init_params sparams = {state_ctx_size, nullptr, true};
+        state.ctx = ggml_init(sparams);
 
-    for (int i = 0; i < n_fpn; ++i) {
-        auto* src = fpn_outs[i];
-        state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32,
-                                                 src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
-        char name[64];
-        snprintf(name, sizeof(name), "neck_trk_%d", i);
-        ggml_set_name(state.neck_trk[i], name);
-    }
-    for (int i = n_fpn; i < 4; ++i) {
-        state.neck_trk[i] = nullptr;
-    }
+        for (int i = 0; i < n_fpn; ++i) {
+            auto* src = fpn_outs[i];
+            state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32,
+                                                     src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+            char name[64];
+            snprintf(name, sizeof(name), "neck_trk_%d", i);
+            ggml_set_name(state.neck_trk[i], name);
+        }
+        for (int i = n_fpn; i < 4; ++i) {
+            state.neck_trk[i] = nullptr;
+        }
 
-    // Allocate state buffer
-    state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+        // Allocate state buffer
+        state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
 
-    // Copy FPN outputs to state
-    for (int i = 0; i < n_fpn; ++i) {
-        int64_t n_bytes = ggml_nbytes(state.neck_trk[i]);
-        std::vector<char> buf(n_bytes);
-        ggml_backend_tensor_get(fpn_outs[i], buf.data(), 0, n_bytes);
-        ggml_backend_tensor_set(state.neck_trk[i], buf.data(), 0, n_bytes);
-    }
+        // Copy FPN outputs to state
+        for (int i = 0; i < n_fpn; ++i) {
+            int64_t n_bytes = ggml_nbytes(state.neck_trk[i]);
+            std::vector<char> buf(n_bytes);
+            ggml_backend_tensor_get(fpn_outs[i], buf.data(), 0, n_bytes);
+            ggml_backend_tensor_set(state.neck_trk[i], buf.data(), 0, n_bytes);
+        }
 
-    // Compute sinusoidal PE for each FPN level
-    size_t pe_ctx_size = ggml_tensor_overhead() * 16;
-    struct ggml_init_params pe_params = {pe_ctx_size, nullptr, true};
-    state.pe_ctx = ggml_init(pe_params);
+        // Compute sinusoidal PE for each FPN level
+        size_t pe_ctx_size = ggml_tensor_overhead() * 16;
+        struct ggml_init_params pe_params = {pe_ctx_size, nullptr, true};
+        state.pe_ctx = ggml_init(pe_params);
 
-    for (int i = 0; i < n_fpn; ++i) {
-        int H = (int)state.neck_trk[i]->ne[2];
-        int W = (int)state.neck_trk[i]->ne[1];
-        state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32,
-                                                    hp.neck_dim, W, H, 1);
-        char name[64];
-        snprintf(name, sizeof(name), "neck_trk_pe_%d", i);
-        ggml_set_name(state.neck_trk_pe[i], name);
-    }
-    state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
-    for (int i = 0; i < n_fpn; ++i) {
-        int H = (int)state.neck_trk[i]->ne[2];
-        int W = (int)state.neck_trk[i]->ne[1];
-        auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
-        ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+        for (int i = 0; i < n_fpn; ++i) {
+            int H = (int)state.neck_trk[i]->ne[2];
+            int W = (int)state.neck_trk[i]->ne[1];
+            state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32,
+                                                        hp.neck_dim, W, H, 1);
+            char name[64];
+            snprintf(name, sizeof(name), "neck_trk_pe_%d", i);
+            ggml_set_name(state.neck_trk_pe[i], name);
+        }
+        state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+        for (int i = 0; i < n_fpn; ++i) {
+            int H = (int)state.neck_trk[i]->ne[2];
+            int W = (int)state.neck_trk[i]->ne[1];
+            auto pe = sam3_sinusoidal_pe_2d(H, W, hp.neck_dim);
+            ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+        }
     }
 
     ggml_gallocr_free(galloc);
@@ -11269,6 +11384,13 @@ static sam3_prop_output sam3_propagate_single(
     }
 
     // ── Build graph ─────────────────────────────────────────────────────
+    // RFD 0011 U0: mem-attn + SAM mask decoder graph CONSTRUCTION region
+    // (mem_attn_build_ms). NOTE: mem-attn and the mask decoder are built into
+    // ONE shared cgraph here and computed with a single sam3_graph_compute
+    // below, so their compute times are not separable — mask_decoder_compute_ms
+    // stays 0 and the combined compute lands in mem_attn_compute_ms. U1 reuses
+    // this graph across frames, which should drive build_ms+alloc_ms → 0.
+    SAM3_TIME_BEGIN(_t_prop_build);
     const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
     struct ggml_init_params gparams = {buf_size, nullptr, true};
     auto* ctx0 = ggml_init(gparams);
@@ -11346,13 +11468,17 @@ static sam3_prop_output sam3_propagate_single(
     ggml_build_forward_expand(graph, dec.obj_score);
     ggml_build_forward_expand(graph, dec.sam_token);
     if (dec.mask_tokens) ggml_build_forward_expand(graph, dec.mask_tokens);
+    SAM3_TIME_END(mem_attn_build_ms, _t_prop_build);
 
+    // RFD 0011 U0: gallocr reserve+alloc region (mem_attn_alloc_ms).
+    SAM3_TIME_BEGIN(_t_prop_alloc);
     auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return output;
     }
+    SAM3_TIME_END(mem_attn_alloc_ms, _t_prop_alloc);
 
     // Upload prompt data
     ggml_backend_tensor_set(prompt_t, pd.prompt.data(), 0, pd.prompt.size() * sizeof(float));
@@ -11394,11 +11520,16 @@ static sam3_prop_output sam3_propagate_single(
         ggml_backend_tensor_set(trk_s1, s1.data(), 0, D * H1 * H1 * sizeof(float));
     }
 
+    // RFD 0011 U0: backend compute of the shared mem-attn + mask-decoder graph
+    // (mem_attn_compute_ms holds the COMBINED time; mask_decoder_compute_ms is 0
+    // because the decoder is fused into this same graph on the EdgeTAM path).
+    SAM3_TIME_BEGIN(_t_prop_compute);
     if (!sam3_graph_compute(model.backend, graph, 4)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return output;
     }
+    SAM3_TIME_END(mem_attn_compute_ms, _t_prop_compute);
 
     const int mhw = H * 4;
     const int num_mask_tokens = hp.sam_n_multimask + 1;  // 4
@@ -11523,6 +11654,9 @@ static bool sam3_encode_memory(
     for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * sig_scale + sig_bias; }
     auto m_interp = sam3_bilinear_interpolate(m_hires.data(), HIGH_RES, HIGH_RES, INTERPOL, INTERPOL);
 
+    // RFD 0011 U0: memory-encoder graph CONSTRUCTION region (mem_encoder_build_ms).
+    // U1 will reuse this graph across frames; build_ms+alloc_ms should drop to ~0.
+    SAM3_TIME_BEGIN(_t_mem_build);
     const size_t bs = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
     struct ggml_init_params gp = {bs, nullptr, true};
     auto* ctx0 = ggml_init(gp);
@@ -11577,12 +11711,18 @@ static bool sam3_encode_memory(
 
     auto* g = ggml_new_graph_custom(ctx0, 16384, false);
     ggml_build_forward_expand(g, mo);
+    SAM3_TIME_END(mem_encoder_build_ms, _t_mem_build);
+
+    // RFD 0011 U0: gallocr reserve+alloc region (mem_encoder_alloc_ms).
+    SAM3_TIME_BEGIN(_t_mem_alloc);
     auto* ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!ggml_gallocr_reserve(ga, g) || !ggml_gallocr_alloc_graph(ga, g)) {
         ggml_gallocr_free(ga);
         ggml_free(ctx0);
         return false;
     }
+    SAM3_TIME_END(mem_encoder_alloc_ms, _t_mem_alloc);
+
     ggml_backend_tensor_set(mask_in, m_interp.data(), 0, m_interp.size() * sizeof(float));
     // Copy pixel features from state tensor to fresh input
     {
@@ -11590,11 +11730,20 @@ static bool sam3_encode_memory(
         ggml_backend_tensor_get(state.neck_trk[2], pix_data.data(), 0, D * H * H * sizeof(float));
         ggml_backend_tensor_set(pix_in_raw, pix_data.data(), 0, D * H * H * sizeof(float));
     }
+    // RFD 0011 U0: backend compute of the memory encoder (mem_encoder_compute_ms).
+    SAM3_TIME_BEGIN(_t_mem_compute);
     if (!sam3_graph_compute(model.backend, g, 4)) {
         ggml_gallocr_free(ga);
         ggml_free(ctx0);
         return false;
     }
+    SAM3_TIME_END(mem_encoder_compute_ms, _t_mem_compute);
+
+    // RFD 0011 U0: everything from here to the end of the function is the
+    // memory-bank update (memory_bank_update_ms): reading the encoder output,
+    // the EdgeTAM perceiver compression, allocating the slot's backend buffers,
+    // and pushing/evicting slots in tracker.mem_banks.
+    SAM3_TIME_BEGIN(_t_mem_bank);
 
     std::vector<float> md(MD * H * H);
     ggml_backend_tensor_get(mo, md.data(), 0, md.size() * sizeof(float));
@@ -11629,6 +11778,7 @@ static bool sam3_encode_memory(
         if (!edgetam_perceiver_forward(model, md, mem_pos, H, H,
                                         perc_latents, perc_pos)) {
             fprintf(stderr, "%s: perceiver forward failed\n", __func__);
+            SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
             ggml_gallocr_free(ga);
             ggml_free(ctx0);
             return false;
@@ -11668,6 +11818,7 @@ static bool sam3_encode_memory(
                 }
             if (!removed) bk.erase(bk.begin() + 1);
         }
+        SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
         ggml_gallocr_free(ga);
         ggml_free(ctx0);
         return true;
@@ -11709,6 +11860,7 @@ static bool sam3_encode_memory(
             }
         if (!removed) bk.erase(bk.begin() + 1);
     }
+    SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
     ggml_gallocr_free(ga);
     ggml_free(ctx0);
     return true;
@@ -12134,7 +12286,15 @@ sam3_result sam3_propagate_frame(
         const sam3_model& model, const sam3_image& frame) {
     sam3_result result;
     const int D = model.hparams.neck_dim;
-    if (!sam3_encode_image(state, model, frame)) return result;
+    // RFD 0011 U0: total_ms is the whole-frame wall time for the hold loop.
+    // image_encoder_* / preprocess / state_update (partial) are recorded inside
+    // sam3_encode_image; mem_attn_* and mem_encoder_* / memory_bank_update are
+    // recorded inside sam3_propagate_single / sam3_encode_memory below.
+    SAM3_TIME_BEGIN(_t_frame_total);
+    if (!sam3_encode_image(state, model, frame)) {
+        SAM3_TIME_END(total_ms, _t_frame_total);
+        return result;
+    }
     int fi = tracker.frame_index;
     fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
             __func__, fi, tracker.masklets.size(), tracker.pending.size());
@@ -12212,9 +12372,17 @@ sam3_result sam3_propagate_frame(
     }
 
     // ── Update tracker state (confirmation / eviction) ───────────────────
-    sam3_update_tracker(tracker, fi);
+    // RFD 0011 U0: confirmation/eviction bookkeeping is part of state_update_ms
+    // (accumulates with the encoder's post-compute state copy from this frame).
+    {
+        SAM3_TIME_SCOPE(state_update_ms);
+        sam3_update_tracker(tracker, fi);
+    }
 
     // ── Build result ─────────────────────────────────────────────────────
+    // RFD 0011 U0: converting the per-instance masks into detection bboxes
+    // (and post-processing the masks) is mask_to_bbox_ms.
+    SAM3_TIME_BEGIN(_t_mask_bbox);
     auto add_mask_to_result = [&](int inst_id, float score, const sam3_mask& mask) {
         if (mask.data.empty()) return;
         sam3_detection det;
@@ -12253,9 +12421,11 @@ sam3_result sam3_propagate_frame(
         sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height,
                               tracker.params.fill_hole_area);
     }
+    SAM3_TIME_END(mask_to_bbox_ms, _t_mask_bbox);
     tracker.frame_index++;
     SAM3_LOG(2, "%s: frame %d done — %zu tracked\n",
              __func__, fi, result.detections.size());
+    SAM3_TIME_END(total_ms, _t_frame_total);
     return result;
 }
 

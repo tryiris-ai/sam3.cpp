@@ -27,6 +27,17 @@ target_include_directories(sam3 PUBLIC
 target_link_libraries(sam3 PUBLIC ggml)
 target_compile_features(sam3 PUBLIC cxx_std_14)
 
+# RFD 0011 U0: per-frame "hold" timing instrumentation. OFF by default so the
+# library has strictly zero timing overhead in normal builds (the SAM3_TIME_*
+# macros expand to nothing and sam3_take_frame_timing() returns zeros). The
+# RFD-0011 EdgeTAM bench requires this ON. PUBLIC so the definition propagates
+# to consumers (e.g. sam3_edgetam_bench), keeping the bench's own copy of the
+# HoldFrameTiming layout in agreement with the library's.
+option(SAM3_TIMING "Compile per-frame hold-timing instrumentation into sam3" OFF)
+if(SAM3_TIMING)
+    target_compile_definitions(sam3 PUBLIC SAM3_TIMING)
+endif()
+
 # Examples (only when top-level)
 option(SAM3_BUILD_EXAMPLES "Build example executables" ON)
 if(SAM3_BUILD_EXAMPLES AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

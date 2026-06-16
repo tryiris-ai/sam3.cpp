@@ -517,3 +517,70 @@ bool sam3_profile_edgetam_encode(const sam3_model & model,
                                  int                n_threads = 4,
                                  int                n_warmup  = 2,
                                  int                n_iter    = 5);
+
+/*
+** ── Per-frame "hold" timing (RFD 0011 U0) ────────────────────────────────
+**
+** Fine-grained, per-frame latency breakdown of the EdgeTAM video tracker's
+** steady-state "hold" loop (encode image -> propagate -> encode memory).
+**
+** WHY THE BUILD/ALLOC/COMPUTE SPLIT MATTERS:
+** Each per-frame stage that builds a fresh ggml graph is measured as THREE
+** separate numbers — graph construction (build), gallocr reserve+alloc
+** (alloc), and backend compute (compute) — NOT one lumped total. RFD 0011
+** unit U1 eliminates the per-frame graph rebuild; its acceptance criterion is
+** "build_ms + alloc_ms ≈ 0 in steady state". If build+alloc+compute were
+** lumped together, U1 would be unverifiable. So every graph-building stage
+** here exposes its three components independently.
+**
+** All fields are wall-clock milliseconds for ONE frame. Stages that run once
+** per tracked instance per frame (propagation, memory encode) accumulate
+** across instances; with a single tracked instance (the bench default) the
+** accumulation is exactly one call. Fields that are not separable on a given
+** path are documented inline and reported as 0.
+**
+** Instrumentation is compiled in only when the sam3 library is built with
+** -DSAM3_TIMING. When that flag is absent the timers are zero-overhead and
+** sam3_take_frame_timing() returns an all-zero struct.
+*/
+struct HoldFrameTiming {
+    double preprocess_ms = 0.0;            // image preprocessing (resize + normalize)
+
+    double image_encoder_build_ms   = 0.0; // RepViT+FPN graph construction
+    double image_encoder_alloc_ms   = 0.0; // gallocr reserve + alloc_graph
+    double image_encoder_compute_ms = 0.0; // backend compute of the image encoder
+
+    // Propagation: memory-attention + SAM mask decoder share ONE ggml graph
+    // (sam3_propagate_single builds mem-attn and the mask decoder into the
+    // same cgraph and computes once), so mem_attn_compute_ms below holds the
+    // COMBINED mem-attn + mask-decoder compute time. See mask_decoder_compute_ms.
+    double mem_attn_build_ms   = 0.0;      // mem-attn + mask-decoder graph construction
+    double mem_attn_alloc_ms   = 0.0;      // gallocr reserve + alloc_graph
+    double mem_attn_compute_ms = 0.0;      // backend compute (mem-attn + mask decoder)
+
+    // The EdgeTAM propagation path fuses the memory-attention and SAM mask
+    // decoder into a single shared graph, so the mask decoder's compute time
+    // is NOT separable from mem-attn. It is folded into mem_attn_compute_ms and
+    // this field is always 0 on the EdgeTAM hold path (kept for API symmetry /
+    // future paths where the decoder is a distinct graph).
+    double mask_decoder_compute_ms = 0.0;
+
+    double mem_encoder_build_ms   = 0.0;   // memory-encoder graph construction
+    double mem_encoder_alloc_ms   = 0.0;   // gallocr reserve + alloc_graph
+    double mem_encoder_compute_ms = 0.0;   // backend compute of the memory encoder
+
+    double memory_bank_update_ms = 0.0;    // perceiver compress + memory-slot store
+    double mask_to_bbox_ms       = 0.0;    // mask -> bbox extraction for the result
+    double state_update_ms       = 0.0;    // tracker confirmation/eviction + state copy
+
+    double total_ms = 0.0;                 // whole-frame wall time
+};
+
+/*
+** Fetch the timing record accumulated for the most recent frame and RESET the
+** internal accumulator to zero, ready for the next frame. Call once per frame
+** immediately after sam3_propagate_frame / sam3_track_frame returns.
+**
+** Returns an all-zero struct when the library was built without -DSAM3_TIMING.
+*/
+HoldFrameTiming sam3_take_frame_timing();

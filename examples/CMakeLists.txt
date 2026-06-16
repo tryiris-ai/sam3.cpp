@@ -10,6 +10,15 @@ target_link_libraries(sam3_benchmark PRIVATE sam3)
 add_executable(sam3_profile_edgetam profile_edgetam.cpp)
 target_link_libraries(sam3_profile_edgetam PRIVATE sam3)
 
+# RFD 0011 U0: per-frame EdgeTAM video-replay bench + JSON dump. Requires the
+# HoldFrameTiming instrumentation, so it compiles with SAM3_TIMING. The library
+# must ALSO be built with -DSAM3_TIMING (top-level option SAM3_TIMING=ON) for
+# the timers inside sam3.cpp to be active; this PRIVATE definition keeps the
+# bench's own translation unit consistent and self-documents the requirement.
+add_executable(sam3_edgetam_bench sam3_edgetam_bench.cpp)
+target_link_libraries(sam3_edgetam_bench PRIVATE sam3)
+target_compile_definitions(sam3_edgetam_bench PRIVATE SAM3_TIMING)
+
 # SDL2 + ImGui are optional — build only if SDL2 is found.
 find_package(SDL2 QUIET)
 
