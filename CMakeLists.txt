@@ -38,6 +38,26 @@ if(SAM3_TIMING)
     target_compile_definitions(sam3 PUBLIC SAM3_TIMING)
 endif()
 
+# RFD 0011 (CoreML/ANE hybrid): run the EdgeTAM image encoder via CoreML on the
+# Apple Neural Engine (~12 ms) instead of the ggml/Metal RepViT path (~122 ms).
+# Apple-only; compiles the Objective-C++ bridge (coreml/edgetam_coreml.mm) and
+# links the CoreML + Foundation frameworks. OFF by default. Even with this ON,
+# the encoder path is gated at RUNTIME by the SAM3_COREML_ENCODER env var (+ the
+# model path in SAM3_COREML_MODEL), so a SAM3_COREML build still defaults to ggml.
+if(APPLE)
+    option(SAM3_COREML "Build the CoreML/ANE EdgeTAM encoder bridge" OFF)
+    if(SAM3_COREML)
+        # Enable Objective-C++ HERE (after add_subdirectory(ggml)) — enabling it
+        # earlier makes ggml's Metal .m files compile as C++ and breaks them.
+        enable_language(OBJCXX)
+        target_sources(sam3 PRIVATE coreml/edgetam_coreml.mm)
+        set_source_files_properties(coreml/edgetam_coreml.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        target_include_directories(sam3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/coreml)
+        target_compile_definitions(sam3 PUBLIC SAM3_COREML)
+        target_link_libraries(sam3 PUBLIC "-framework CoreML" "-framework Foundation")
+    endif()
+endif()
+
 # Examples (only when top-level)
 option(SAM3_BUILD_EXAMPLES "Build example executables" ON)
 if(SAM3_BUILD_EXAMPLES AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
