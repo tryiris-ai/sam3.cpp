@@ -25,12 +25,14 @@ typedef void* edgetam_coreml_handle;
 edgetam_coreml_handle edgetam_coreml_create(const char* model_path, int compute_units);
 
 // Run the encoder. `input_norm` is a contiguous [1,3,1024,1024] f32 buffer
-// (already ImageNet-normalized, same as the ggml path's preprocessing).
-// Outputs are written as contiguous PyTorch-NCHW f32:
-//   vision_features [1,256,64,64], hr0 [1,32,256,256], hr1 [1,64,128,128].
-// Caller pre-allocates all three. Returns 1 on success, 0 on failure.
+// (already ImageNet-normalized, same NCHW layout as the ggml path's
+// preprocessing). The model exports neck(trunk(x))[0:3] — the 256-ch fused FPN
+// levels that match ggml's neck_trk — CHANNELS-LAST [1,H,W,D], whose contiguous
+// bytes equal ggml's neck_trk [D,W,H]. Outputs (f32, widened from the model's
+// FP16) per level: neck0 256×256×256, neck1 128×128×256, neck2 64×64×256.
+// Caller pre-allocates all three (D*W*H floats each). Returns 1 on success.
 int edgetam_coreml_encode(edgetam_coreml_handle h, const float* input_norm,
-                          float* vision_features, float* hr0, float* hr1);
+                          float* neck0, float* neck1, float* neck2);
 
 void edgetam_coreml_destroy(edgetam_coreml_handle h);
 

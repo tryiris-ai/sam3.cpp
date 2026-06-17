@@ -13,21 +13,31 @@ struct EdgetamCoreML {
     MLModel* model = nil;
 };
 
-// Copy a float32 MLMultiArray's backing bytes into `dst` (dst pre-sized to
-// `count` floats). CoreML model outputs are contiguous C-order; getBytesWithHandler
-// hands back the contiguous backing buffer.
+// Copy an MLMultiArray's backing bytes into `dst` (pre-sized to `count` floats).
+// An FP16 CoreML model emits Float16 outputs, so handle both Float32 (memcpy)
+// and Float16 (widen each element). getBytesWithHandler hands back the
+// contiguous C-order backing buffer.
 static bool copy_f32(MLMultiArray* arr, float* dst, NSInteger count) {
     if (!arr) return false;
-    if (arr.dataType != MLMultiArrayDataTypeFloat32) {
-        NSLog(@"[edgetam_coreml] unexpected output dtype %ld (want Float32)", (long)arr.dataType);
-        return false;
-    }
     __block bool ok = false;
-    [arr getBytesWithHandler:^(const void* bytes, NSInteger size) {
-        NSInteger want = count * (NSInteger)sizeof(float);
-        if (size >= want) { memcpy(dst, bytes, want); ok = true; }
-        else NSLog(@"[edgetam_coreml] output too small: %ld < %ld", (long)size, (long)want);
-    }];
+    if (arr.dataType == MLMultiArrayDataTypeFloat32) {
+        [arr getBytesWithHandler:^(const void* bytes, NSInteger size) {
+            NSInteger want = count * (NSInteger)sizeof(float);
+            if (size >= want) { memcpy(dst, bytes, want); ok = true; }
+            else NSLog(@"[edgetam_coreml] f32 output too small: %ld < %ld", (long)size, (long)want);
+        }];
+    } else if (arr.dataType == MLMultiArrayDataTypeFloat16) {
+        [arr getBytesWithHandler:^(const void* bytes, NSInteger size) {
+            NSInteger want = count * (NSInteger)sizeof(__fp16);
+            if (size >= want) {
+                const __fp16* src = (const __fp16*)bytes;     // ARM64 half precision
+                for (NSInteger i = 0; i < count; ++i) dst[i] = (float)src[i];
+                ok = true;
+            } else NSLog(@"[edgetam_coreml] f16 output too small: %ld < %ld", (long)size, (long)want);
+        }];
+    } else {
+        NSLog(@"[edgetam_coreml] unexpected output dtype %ld", (long)arr.dataType);
+    }
     return ok;
 }
 }  // namespace
@@ -70,7 +80,7 @@ edgetam_coreml_handle edgetam_coreml_create(const char* model_path, int compute_
 }
 
 int edgetam_coreml_encode(edgetam_coreml_handle handle, const float* input_norm,
-                          float* vision_features, float* hr0, float* hr1) {
+                          float* neck0, float* neck1, float* neck2) {
     @autoreleasepool {
         auto* h = (EdgetamCoreML*)handle;
         if (!h || !h->model) return 0;
@@ -91,13 +101,15 @@ int edgetam_coreml_encode(edgetam_coreml_handle handle, const float* input_norm,
         id<MLFeatureProvider> out = [h->model predictionFromFeatures:fp error:&err];
         if (err || !out) { NSLog(@"[edgetam_coreml] predict failed: %@", err); return 0; }
 
-        MLMultiArray* vf  = [[out featureValueForName:@"vision_features"] multiArrayValue];
-        MLMultiArray* a0  = [[out featureValueForName:@"hr0"] multiArrayValue];
-        MLMultiArray* a1  = [[out featureValueForName:@"hr1"] multiArrayValue];
+        // The encoder exports neck(trunk(x))[0:3] — the 256-ch fused FPN levels
+        // that match ggml's neck_trk. neck0 256x256, neck1 128x128, neck2 64x64.
+        MLMultiArray* n0  = [[out featureValueForName:@"neck0"] multiArrayValue];
+        MLMultiArray* n1  = [[out featureValueForName:@"neck1"] multiArrayValue];
+        MLMultiArray* n2  = [[out featureValueForName:@"neck2"] multiArrayValue];
 
-        bool ok = copy_f32(vf, vision_features, 1 * 256 * 64 * 64)
-               && copy_f32(a0, hr0,             1 * 32 * 256 * 256)
-               && copy_f32(a1, hr1,             1 * 64 * 128 * 128);
+        bool ok = copy_f32(n0, neck0, 1 * 256 * 256 * 256)
+               && copy_f32(n1, neck1, 1 * 256 * 128 * 128)
+               && copy_f32(n2, neck2, 1 * 256 * 64 * 64);
         return ok ? 1 : 0;
     }
 }

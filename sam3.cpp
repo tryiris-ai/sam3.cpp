@@ -4972,6 +4972,86 @@ static void edgetam_build_repvit_graph(struct ggml_context* ctx,
     }
 }
 
+#ifdef SAM3_COREML
+#include "edgetam_coreml.h"
+// RFD 0011 (CoreML/ANE hybrid): run the EdgeTAM encoder on CoreML/ANE (~12 ms)
+// instead of the ggml/Metal RepViT (~122 ms) and load the ggml-matching 256-ch
+// neck features into state.neck_trk. The CoreML model exports neck(trunk(x))[0:3]
+// — the same fused FPN levels ggml's edgetam_build_fpn_neck_graph computes.
+// Enabled by SAM3_COREML_ENCODER=1 + SAM3_COREML_MODEL=<path-to.mlpackage>.
+// Reuses U1's persistent state (allocate once; per-frame only the data changes).
+static bool edgetam_encode_image_coreml(sam3_state& state, const sam3_model& model,
+                                        const sam3_image& image,
+                                        const std::vector<float>& img_norm) {
+    static edgetam_coreml_handle s_enc = nullptr;
+    if (!s_enc) {
+        const char* mp = getenv("SAM3_COREML_MODEL");
+        if (!mp) { fprintf(stderr, "%s: SAM3_COREML_ENCODER set but SAM3_COREML_MODEL unset\n", __func__); return false; }
+        s_enc = edgetam_coreml_create(mp, /*compute_units=ANE*/ 1);
+        if (!s_enc) { fprintf(stderr, "%s: CoreML encoder load failed\n", __func__); return false; }
+        fprintf(stderr, "%s: CoreML EdgeTAM encoder loaded (ANE): %s\n", __func__, mp);
+    }
+    const auto& hp = model.hparams;
+    const int D = hp.neck_dim;                 // 256
+    state.orig_width = image.width; state.orig_height = image.height;
+
+    // CoreML exports the 3 fused levels CHANNELS-LAST [1, H, W, D]; those
+    // contiguous bytes equal ggml neck_trk [D, W, H] (d innermost), so the load
+    // below is a direct memcpy — no transpose. Levels are square (W == H).
+    const int Wd[3] = {256, 128, 64};
+    const int Hd[3] = {256, 128, 64};
+    static std::vector<float> nbuf[3];
+    for (int i = 0; i < 3; ++i) nbuf[i].resize((size_t)D * Wd[i] * Hd[i]);
+
+    {
+        SAM3_TIME_SCOPE(image_encoder_compute_ms);   // the ANE inference itself
+        if (!edgetam_coreml_encode(s_enc, img_norm.data(),
+                                   nbuf[0].data(), nbuf[1].data(), nbuf[2].data()))
+            return false;
+    }
+
+    // Build/refresh the persistent state (U1 reuse) and permute CoreML's
+    // [D,H,W] (NCHW, W innermost) into ggml neck_trk [D,W,H] (D innermost).
+    {
+        SAM3_TIME_SCOPE(state_update_ms);
+        bool reuse = state.buffer && state.pe_buf && state.neck_trk[0]
+                  && state.neck_trk[0]->ne[0] == D && state.neck_trk[0]->ne[1] == Wd[0];
+        if (!reuse) {
+            if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+            if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+            if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+            if (state.ctx)    { ggml_free(state.ctx);    state.ctx = nullptr; }
+            struct ggml_init_params sp = {ggml_tensor_overhead() * 32, nullptr, true};
+            state.ctx = ggml_init(sp);
+            for (int i = 0; i < 3; ++i) {
+                state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
+                char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_%d", i); ggml_set_name(state.neck_trk[i], nm);
+            }
+            state.neck_trk[3] = nullptr;
+            state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+            // Positional encoding (same as the ggml path: sinusoidal_pe_2d(H, W, D)).
+            struct ggml_init_params pp = {ggml_tensor_overhead() * 16, nullptr, true};
+            state.pe_ctx = ggml_init(pp);
+            for (int i = 0; i < 3; ++i) {
+                state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
+                char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_pe_%d", i); ggml_set_name(state.neck_trk_pe[i], nm);
+            }
+            state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+            for (int i = 0; i < 3; ++i) {
+                auto pe = sam3_sinusoidal_pe_2d(Hd[i], Wd[i], D);
+                ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+            }
+        }
+        // The CoreML model exports channels-last [1,H,W,D], whose contiguous
+        // bytes are byte-identical to ggml neck_trk [D,W,H] (d innermost, then W,
+        // then H). So each level loads with a DIRECT copy — no per-frame transpose.
+        for (int i = 0; i < 3; ++i)
+            ggml_backend_tensor_set(state.neck_trk[i], nbuf[i].data(), 0, nbuf[i].size() * sizeof(float));
+    }
+    return true;
+}
+#endif  // SAM3_COREML
+
 // Full EdgeTAM image encoding: preprocess → RepViT → FPN → state
 static bool edgetam_encode_image(sam3_state& state,
                                   const sam3_model& model,
@@ -4993,6 +5073,16 @@ static bool edgetam_encode_image(sam3_state& state,
         SAM3_TIME_SCOPE(preprocess_ms);
         img_data = sam2_preprocess_image(image, img_size);
     }
+
+#ifdef SAM3_COREML
+    // RFD 0011 (CoreML/ANE hybrid): when enabled, run the encoder on CoreML/ANE
+    // and skip the ggml RepViT+FPN graph entirely. img_data is already NCHW
+    // [1,3,1024,1024] (ggml inp ne=[W,H,C] == numpy NCHW), so it hands straight
+    // to CoreML; only the 256-ch neck outputs need a layout permute (in helper).
+    if (getenv("SAM3_COREML_ENCODER")) {
+        return edgetam_encode_image_coreml(state, model, image, img_data);
+    }
+#endif
 
     // ── Build graph ──────────────────────────────────────────────────────
     // RFD 0011 U0: graph CONSTRUCTION region (image_encoder_build_ms). U1 will
