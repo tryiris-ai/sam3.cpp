@@ -95,6 +95,45 @@ projected. Reaching it in production means a pure-CoreML runtime (port the track
 glue + memory bank to the CoreML/host side; the 4 stage models are the building
 blocks, all parity-verified).
 
+## Alignment with Egor Dmitriev's CoreML methodology (part-3)
+
+Egor's [part-3](https://egordmitriev.dev/blog/2026-05-18-optimizing-samurai-part-3)
+is the reference deployment for this exact model class on Apple silicon. He runs the
+SAM2/EfficientTAM ONNX modules through **ONNX Runtime's CoreML EP**; we run **native
+`coremltools` MLProgram models** behind a CoreML.framework bridge, bolted onto the ggml
+tracker. Different substrate, same physics. Where we land vs his steps:
+
+| Egor's part-3 step | here | match |
+|---|---|---|
+| **MLProgram** container (his #1 win: ORT op-coverage 9%→93%, 3.2×) | `coremltools` emits MLProgram by default | ✓ same target (free for us; he had to flip ORT off its legacy NeuralNetwork default) |
+| **Kill RoPE dynamic int-ops** that fragment the graph (Gather→Split/Squeeze, ScatterND→Split/Concat, found in Netron) | real-valued RoPE + constant-shape reshapes + `jit.freeze`, at the torch level | ✓ same fix, one layer earlier (we never emit ONNX) |
+| **Heterogeneous per-module compute units** | encoder→ANE, mem-attn→GPU, decoder→ANE | ✓ principle; winners differ (gap below) |
+| **FP16**, verify small accuracy cost | FP16 exports; box-jitter doesn't move `tracked_fraction` | ✓ (he: −0.012 mIoU; us: same shape) |
+| **Boundary-crossing cost dominates kernel speed** | quantified: 0.17 ms glue proves the hybrid's 6 fps was *all* ggml↔CoreML marshalling | ✓ same lesson, different boundary |
+| **3-stage threaded pipelining** (his 15.9→29.6 fps — biggest throughput lever) | **not done** — sequential chain only; this is the U5 roadmap item | ✗ the gap |
+| runtime = **ORT CoreML EP over ONNX** | native `coremltools` + ggml hybrid | different by design |
+
+**Two gaps explain our 19 vs his 28 fps:**
+1. **Pipelining (U5).** He overlaps preprocess ∥ encoder ∥ (mem-attn+decoder) on
+   physically separate silicon via bounded queues — ~1.9× at bit-exact accuracy. Our
+   19 fps is his *pre-pipelining* regime.
+2. **CPUOnly/BNNS encoder — untested here.** His most surprising finding: the ViT
+   encoder was fastest on **CPUOnly (BNNS/AMX)**, beating both GPU and ANE (23.7 vs 29.6
+   ANE vs 44 GPU) — the encoder is ~60 tiny dispatches and dispatch overhead swamps the
+   GPU. We placed the encoder on **ANE** and never benchmarked CPUOnly. A one-line
+   `compute_units` sweep would settle it.
+
+**FPS reconciliation:** 19.1 fps (3-stage sequential, M4 Pro) ≈ his sequential regime;
+add the 4th stage (memory-encode, ~12 ms) → ~15–16 fps sequential, landing on his own
+15.4–15.9; add his pipelining (~1.9×) → ~28–30 fps. The numbers are coherent — we are at
+his pre-pipelining stage on a faster chip, and the remaining distance to real-time is
+exactly the pipelining step (plus the 4th-stage export).
+
+Two corrections from reading the post: part-3 is **plain FP16** (the attention-in-FP32
+mixed-precision was part-2 / TensorRT), and part-3 leans on **CPU/GPU, not the ANE** (he
+skips the ANE for memory_attention too) — the opposite of our encoder placement, which is
+why the CPUOnly encoder benchmark is worth running.
+
 ## Decoder leg in the HYBRID — transfer-bound, NOT recommended there (2-leg is optimal)
 NB: the decoder being "transfer-bound" is a **hybrid-only** artifact (its 84 MB
 256-ch high-res inputs cross the ggml↔CoreML boundary each frame). In the
