@@ -35,29 +35,25 @@ Thread B (consumer):  mem-attn[N] → decoder[N] →          │
 Throughput is **consumer-bound** (encoder hides behind it). Measured/expected per-stage
 on M4 Pro:
 
-| consumer stage | ms | unit |
+| consumer stage | ms (measured) | unit |
 |---|--:|---|
-| mem-attn | 24 | GPU |
-| mask decoder | 7 | ANE |
-| memory-encode | **? (Egor's was 3.8)** | GPU |
-| **consumer total** | **~35-43** | |
+| mem-attn | 18-24 | GPU |
+| mask decoder | 6-7 | ANE |
+| memory-encode | **5.0** | ANE/GPU |
+| **consumer total** | **~29-36** | |
 
-- If memory-encode exports ≈ 4 ms (Egor found it 5.75× faster on CoreML GPU than CPU —
-  "the unsung hero"): consumer ≈ 35 ms → **~28 fps**. Reaches the bar.
-- If memory-encode ≈ 12 ms: consumer ≈ 43 ms → **~23 fps**. Honest floor.
-
-So **the memory-encode export is load-bearing for this runtime**, not just the Python
-number — and its CoreML speed is what decides 23 vs 28 fps.
+Memory-encode is now exported and **measured at ~5 ms** (close to Egor's 3.8 ms "unsung
+hero") — not the 10-15 ms feared. So the consumer is ~29-36 ms and, with the encoder hidden
+one frame ahead, the runtime is **consumer-bound at ~28-34 fps**. The full 4-stage
+*sequential* chain already measures **20.3 fps** (`bench/pipeline_coreml_4stage.py`);
+pipelining the encoder ahead of the consumer is the lever from 20 → ~28-34.
 
 ## Build pieces (in order)
 
-1. **Memory-encode CoreML export** — `export/convert_memenc_coreml.py`. Status: the
-   constant-shape perceiver patch + injected constant PEs are **done and parity-verified**
-   (features cosine ≈ 1.0); `ct.convert` still hits one residual `aten::Int`
-   (`only 0-dimensional arrays can be converted to Python scalars`) from a not-yet-isolated
-   node. Next step: `ct.convert(..., debug=True)` (or bisect `MemEnc.forward`) to locate
-   the remaining dynamic int, replace it with a constant like the others. The math is
-   correct; this is convert-plumbing, not algorithm.
+1. **Memory-encode CoreML export** — `export/convert_memenc_coreml.py`. **DONE.**
+   Constant-shape perceiver windowing + head-split + injected constant PEs; exported with
+   parity cosine **1.000000**, ~5 ms on ANE/GPU. → `edgetam_memory_encode.mlpackage`. All
+   four stage models now exist; the runtime is glue + threading, no more export blockers.
 2. **Host-side memory bank + glue** — port off ggml: the `num_maskmem` ring, obj-pointer
    management, and the U3 SAMURAI motion-aware selection (currently in `sam3.cpp`) onto
    the CoreML/host side, feeding the mem-attn model's fixed-capacity inputs.
@@ -68,8 +64,8 @@ number — and its CoreML speed is what decides 23 vs 28 fps.
 4. **cgo into platform (U8)** — C-ABI surface, proto/State-Sync/NATS byte-identical gate.
 
 ## What's already done (this PR is the foundation)
-- 3 of 4 stage models exported + parity-verified (encoder 0.992, mem-attn 1.000,
-  decoder 0.999); the 4th is plumbing away (above).
+- All 4 stage models exported + parity-verified (encoder 0.992, mem-attn 1.000,
+  decoder 0.999, memory-encode 1.000) and benched.
 - The Obj-C++ bridge with resident-model load + FP16 widening + compute-unit selection.
 - The hybrid proving the stages are correct end-to-end (goldeneval 0.939, wrong-person 0).
 - The measured ceilings (sequential 19, threaded 23.7) that set the runtime's target.

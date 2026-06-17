@@ -65,10 +65,10 @@ SAM3_COREML_MEMATTN=1 SAM3_COREML_MEMATTN_MODEL=<...>/edgetam_memory_attention.m
   reshapes + rank-≤5 k-rope). → `edgetam_memory_attention.mlpackage`.
 - mask decoder: `export/convert_maskdec_coreml_nhwc.py` (channels-last NHWC).
   → `edgetam_mask_decoder_nhwc.mlpackage`.
-- memory-encode (stage 4): `export/convert_memenc_coreml.py` — constant-shape perceiver
-  windowing + injected constant PEs, **parity-verified but `ct.convert` still blocked on
-  one residual `aten::Int`**. The only un-exported stage; see `coreml/RUNTIME.md` for the
-  turnkey finish and why its CoreML speed is load-bearing for the real-time runtime.
+- memory-encode (stage 4): `export/convert_memenc_coreml.py` (memory_encoder +
+  spatial_perceiver) — constant-shape perceiver windowing + head-split + injected constant
+  PEs. **Exported, parity cosine 1.000000, ~5 ms on ANE/GPU.**
+  → `edgetam_memory_encode.mlpackage`. All 4 stages are now exported.
 
 ## Pure-CoreML pipeline — MEASURED 19 fps (the real-time path)
 
@@ -76,32 +76,38 @@ A standalone pure-CoreML chain (`audits/goldenclip-eval/pipeline_coreml.py`, no
 ggml) chains the three CoreML stages with real output→input handoffs and times
 the per-frame loop on this M4 Pro (100 frames):
 
-| stage | ms |
-|---|--:|
-| encoder (ANE) | 21.0 |
-| memory attention (GPU) | 23.8 |
-| decoder (ANE) | 7.3 |
-| **glue / handoff** | **0.17** |
-| **per-frame** | **52.3 → 19.1 fps** |
+| stage | ms (3-stage run) | ms (4-stage run) |
+|---|--:|--:|
+| encoder (ANE) | 21.0 | 19.3 |
+| memory attention (GPU) | 23.8 | 17.7 |
+| decoder (ANE) | 7.3 | 6.5 |
+| memory-encode (ANE/GPU) | — | **5.0** |
+| **glue / handoff** | **0.17** | — |
+| **per-frame** | **52.3 → 19.1 fps** | **49.3 → 20.3 fps** |
+
+**The 4th stage now exports** (`export/convert_memenc_coreml.py`, parity cosine
+**1.000000**), so the full pipeline is **measured at 20.3 fps**, not estimated — and
+memory-encode is only ~5 ms (Egor's "unsung hero"), so the earlier ~15-16 fps estimate
+was pessimistic. All 4 stage models are now parity-verified.
 
 **This settles the 6-vs-15-20 question.** The cross-stage handoff is **0.17 ms**
 (negligible) — so the hybrid's 6.1 fps was **entirely** the ggml↔CoreML
 marshalling (84 MB decoder inputs, per-stage input copies), NOT chaining or
 compute. A pure-CoreML pipeline (everything on the CoreML side, no ggml
-round-trips) hits **19 fps for the 3 stages**; adding the 4th stage
-(memory-encode, ~10–15 ms — its CoreML export hits the same perceiver
-constant-shape `int`-op wall the other stages cleared with reshape patches,
-solvable) lands the full tracker at **~15–16 fps** — matching the EdgeTAM-paper /
-PABannier "15–20 on M-series" figure. Per-stage times run a bit higher than
-isolated (ANE/GPU contention back-to-back), but the throughput is real.
+round-trips) hits **19 fps for the 3 stages**, and the **full 4-stage chain is now
+measured at 20.3 fps** (`bench/pipeline_coreml_4stage.py`) — the 4th stage
+(memory-encode) exported once its perceiver head-split was given the same
+constant-shape patch the other stages used, and it runs only ~5 ms — matching the
+EdgeTAM-paper / PABannier "15–20 on M-series" figure. Per-stage times vary a bit run
+to run (ANE/GPU contention back-to-back), but the throughput is real.
 
 **Bottom line:** the **hybrid (6.1 fps)** is the validated, accuracy-held config shipping
 in this PR (CoreML stages bolted onto the proven ggml tracker). The **pure-CoreML pipeline
-(19 fps sequential / 23.7 fps threaded)** is *measured* (`bench/pipeline_coreml*.py`), and
-sets the target for the production **pure-CoreML C++ runtime** that reaches Egor's ~28-30
-fps — designed in `coreml/RUNTIME.md` (a separate PR: it ports the tracker glue + memory
-bank off ggml and needs the stage-4 export finished). 3 of 4 stage models are
-parity-verified; the 4th (memory-encode) is plumbing away.
+(20.3 fps full 4-stage sequential / 23.7 fps threaded-3-stage)** is *measured*
+(`bench/pipeline_coreml*.py`), and sets the target for the production **pure-CoreML C++
+runtime** that reaches Egor's ~28-30 fps — designed in `coreml/RUNTIME.md` (a separate PR:
+it ports the tracker glue + memory bank off ggml). **All 4 stage models are now exported and
+parity-verified** (encoder 0.992, mem-attn 1.000, decoder 0.999, memory-encode 1.000).
 
 ## U5 threaded pipeline — MEASURED (the real-time leg, native coremltools)
 

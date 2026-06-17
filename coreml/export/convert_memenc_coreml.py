@@ -42,6 +42,29 @@ def patch_perceiver(perc):
     num_window = int(math.sqrt(perc.num_latents_2d))   # 16
     window_size = H // num_window                       # 4
 
+    # Same wall convert_memattn hit: PerceiverAttention._separate_heads does
+    # `b,n,c = x.shape; x.reshape(b,n,nh, c//nh)` -> the c//nh is a shape-derived int cast
+    # (aten::Int) coremltools can't const-fold. Replace head split/merge with reshape(1,-1,..)
+    # using only constants + the -1 inferred token dim (no x.shape reads at all).
+    def _patch_heads(attn):
+        nh = attn.heads
+        inner = attn.to_q.out_features
+        hd = inner // nh
+        # keep b,n symbolic (the 2d path has batch=num_windows=256, not 1); only the channel
+        # split c//nh -> constant hd, and the merge nh*cph -> constant inner, were the int casts.
+        def _sep(x, num_heads, _nh=nh, _hd=hd):
+            b, n, c = x.shape
+            return x.reshape(b, n, _nh, _hd).transpose(1, 2)
+        def _recomb(x, _inner=inner):
+            b, h, n, cph = x.shape
+            return x.transpose(1, 2).reshape(b, n, _inner)
+        attn._separate_heads = _sep
+        attn._recombine_heads = _recomb
+    for layer in perc.layers:
+        _patch_heads(layer.attn)
+        if getattr(layer, "use_self_attn", False):
+            _patch_heads(layer.self_attn)
+
     def forward_1d(x, pos):
         # mirrors the original exactly; only dynamic expand(x.shape[0]) -> expand(1)
         latents = perc.latents.unsqueeze(0).expand(1, -1, -1)        # B=1 literal
