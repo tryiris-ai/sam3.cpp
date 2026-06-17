@@ -34,6 +34,18 @@ edgetam_coreml_handle edgetam_coreml_create(const char* model_path, int compute_
 int edgetam_coreml_encode(edgetam_coreml_handle h, const float* input_norm,
                           float* neck0, float* neck1, float* neck2);
 
+// Run the memory-attention model (a separate handle/model from the encoder).
+// All inputs are f32 contiguous; ggml's [feature,token] layout is byte-identical
+// to the model's [token,1,feature], so the caller passes ggml buffers directly:
+//   curr,curr_pos: 4096*256 floats; memory,memory_pos: 3648*64 floats.
+// `conditioned` (4096*256 floats, widened from the model's FP16) receives the
+// attended output (== ggml mem-attn output layout). Returns 1 on success.
+// Only valid at the fixed steady-state capacity (7 memory frames + 16 obj-ptrs).
+int edgetam_coreml_memattn(edgetam_coreml_handle h,
+                           const float* curr, const float* memory,
+                           const float* curr_pos, const float* memory_pos,
+                           float* conditioned);
+
 void edgetam_coreml_destroy(edgetam_coreml_handle h);
 
 #ifdef __cplusplus

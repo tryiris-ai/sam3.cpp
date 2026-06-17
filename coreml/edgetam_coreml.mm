@@ -114,6 +114,45 @@ int edgetam_coreml_encode(edgetam_coreml_handle handle, const float* input_norm,
     }
 }
 
+int edgetam_coreml_memattn(edgetam_coreml_handle handle,
+                           const float* curr, const float* memory,
+                           const float* curr_pos, const float* memory_pos,
+                           float* conditioned) {
+    @autoreleasepool {
+        auto* h = (EdgetamCoreML*)handle;
+        if (!h || !h->model) return 0;
+        NSError* err = nil;
+        // ggml [feature,token] == model [token,1,feature] byte-for-byte (feature
+        // innermost), so each input is a direct memcpy into the MLMultiArray.
+        auto mk = [&](const float* data, int ntok, int feat) -> MLMultiArray* {
+            MLMultiArray* a = [[MLMultiArray alloc] initWithShape:@[@(ntok), @1, @(feat)]
+                                                         dataType:MLMultiArrayDataTypeFloat32
+                                                            error:&err];
+            if (a) memcpy(a.dataPointer, data, sizeof(float) * (size_t)ntok * feat);
+            return a;
+        };
+        MLMultiArray* c  = mk(curr,       4096, 256);
+        MLMultiArray* m  = mk(memory,     3648, 64);
+        MLMultiArray* cp = mk(curr_pos,   4096, 256);
+        MLMultiArray* mp = mk(memory_pos, 3648, 64);
+        if (!c || !m || !cp || !mp) { NSLog(@"[edgetam_coreml] memattn input alloc: %@", err); return 0; }
+
+        MLDictionaryFeatureProvider* fp =
+            [[MLDictionaryFeatureProvider alloc]
+                initWithDictionary:@{@"curr":       [MLFeatureValue featureValueWithMultiArray:c],
+                                     @"memory":     [MLFeatureValue featureValueWithMultiArray:m],
+                                     @"curr_pos":   [MLFeatureValue featureValueWithMultiArray:cp],
+                                     @"memory_pos": [MLFeatureValue featureValueWithMultiArray:mp]}
+                             error:&err];
+        if (err || !fp) { NSLog(@"[edgetam_coreml] memattn feature provider: %@", err); return 0; }
+
+        id<MLFeatureProvider> out = [h->model predictionFromFeatures:fp error:&err];
+        if (err || !out) { NSLog(@"[edgetam_coreml] memattn predict: %@", err); return 0; }
+        MLMultiArray* o = [[out featureValueForName:@"var_304"] multiArrayValue];
+        return copy_f32(o, conditioned, 1 * 4096 * 256) ? 1 : 0;
+    }
+}
+
 void edgetam_coreml_destroy(edgetam_coreml_handle handle) {
     auto* h = (EdgetamCoreML*)handle;
     if (h) { h->model = nil; delete h; }

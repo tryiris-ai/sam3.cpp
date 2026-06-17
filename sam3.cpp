@@ -11648,6 +11648,42 @@ static sam3_prop_output sam3_propagate_single(
         }
     }
 
+    // RFD 0011 (CoreML/ANE hybrid): run the memory attention on CoreML-GPU
+    // (~18 ms vs ggml ~185 ms) at the fixed steady-state capacity (7 memory
+    // frames × 512 + 16 obj-ptrs × 4 = 3648 tokens). The model's [token,1,feature]
+    // inputs are byte-identical to ggml's [feature,token] CPU buffers, so curr /
+    // memory / positions hand straight over, and the output injects as cond_spatial
+    // into the (unchanged) ggml mask decoder. Frames whose capacity != 3648 (early
+    // bank fill / obj-ptr ramp) fall back to the ggml mem-attn path. Run BEFORE
+    // the build timer — it only needs CPU buffers, not ctx0.
+    bool use_cml_ma = false;
+    std::vector<float> cml_cond;
+#ifdef SAM3_COREML
+    static edgetam_coreml_handle s_memattn = nullptr;
+    static bool s_memattn_tried = false;
+    if (getenv("SAM3_COREML_MEMATTN") && use_perceiver
+        && pd.M_total == 3648 && pd.M_spatial == 3584) {
+        if (!s_memattn && !s_memattn_tried) {
+            s_memattn_tried = true;
+            const char* mp = getenv("SAM3_COREML_MEMATTN_MODEL");
+            if (mp) {
+                s_memattn = edgetam_coreml_create(mp, /*CPU_AND_GPU*/ 2);
+                if (s_memattn) fprintf(stderr, "%s: CoreML mem-attn loaded (GPU): %s\n", __func__, mp);
+            }
+        }
+        if (s_memattn) {
+            std::vector<float> curr_buf((size_t)D * N);
+            ggml_backend_tensor_get(state.neck_trk[2], curr_buf.data(), 0, (size_t)D * N * sizeof(float));
+            cml_cond.resize((size_t)D * N);
+            SAM3_TIME_BEGIN(_t_cml_ma);
+            use_cml_ma = edgetam_coreml_memattn(s_memattn, curr_buf.data(), pd.prompt.data(),
+                                                tracker.cached_sinpe_256.data(),
+                                                pd.prompt_pos.data(), cml_cond.data());
+            SAM3_TIME_END(mem_attn_compute_ms, _t_cml_ma);
+        }
+    }
+#endif
+
     // ── Build graph ─────────────────────────────────────────────────────
     // RFD 0011 U0: mem-attn + SAM mask decoder graph CONSTRUCTION region
     // (mem_attn_build_ms). NOTE: mem-attn and the mask decoder are built into
@@ -11661,42 +11697,49 @@ static sam3_prop_output sam3_propagate_single(
     auto* ctx0 = ggml_init(gparams);
     if (!ctx0) return output;
 
-    // CRITICAL: create fresh input tensors for state features.
-    // Using state.neck_trk[*] directly as ggml_reshape operands pulls in
-    // the entire ViT+neck recomputation from the image encoder graph.
-    auto* curr = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
-    ggml_set_name(curr, "prop_curr");
-    ggml_set_input(curr);
+    // Memory-attention inputs (ggml path only). In the CoreML mem-attn path these
+    // stay null and cond_spatial is an input tensor filled from the CoreML output.
+    struct ggml_tensor* curr = nullptr, * src_pos_t = nullptr;
+    struct ggml_tensor* prompt_t = nullptr, * prompt_pos_t = nullptr;
+    struct ggml_tensor* rope_q_t = nullptr, * rope_k_t = nullptr;
+    struct ggml_tensor* cond_spatial = nullptr;
 
-    // src_pos (sinusoidal PE 256-dim for 72×72)
-    auto* src_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
-    ggml_set_name(src_pos_t, "src_pos");
-    ggml_set_input(src_pos_t);
+    if (use_cml_ma) {
+        // CoreML produced the attended features; inject them as a decoder input.
+        cond_spatial = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+        ggml_set_name(cond_spatial, "cml_conditioned");
+        ggml_set_input(cond_spatial);
+    } else {
+        // CRITICAL: create fresh input tensors for state features.
+        // Using state.neck_trk[*] directly as ggml_reshape operands pulls in
+        // the entire ViT+neck recomputation from the image encoder graph.
+        curr = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
+        ggml_set_name(curr, "prop_curr"); ggml_set_input(curr);
 
-    // Prompt and prompt_pos
-    auto* prompt_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, pd.M_total, 1);
-    ggml_set_name(prompt_t, "prompt");
-    ggml_set_input(prompt_t);
-    auto* prompt_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, pd.M_total, 1);
-    ggml_set_name(prompt_pos_t, "prompt_pos");
-    ggml_set_input(prompt_pos_t);
+        // src_pos (sinusoidal PE 256-dim for 72×72)
+        src_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
+        ggml_set_name(src_pos_t, "src_pos"); ggml_set_input(src_pos_t);
 
-    // RoPE frequencies
-    auto* rope_q_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2, half_d, N);
-    ggml_set_name(rope_q_t, "rope_q");
-    ggml_set_input(rope_q_t);
-    struct ggml_tensor* rope_k_t = nullptr;
-    if (pd.M_spatial > 0) {
-        rope_k_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2, half_d, pd.M_spatial);
-        ggml_set_name(rope_k_t, "rope_k");
-        ggml_set_input(rope_k_t);
+        // Prompt and prompt_pos
+        prompt_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, pd.M_total, 1);
+        ggml_set_name(prompt_t, "prompt"); ggml_set_input(prompt_t);
+        prompt_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, pd.M_total, 1);
+        ggml_set_name(prompt_pos_t, "prompt_pos"); ggml_set_input(prompt_pos_t);
+
+        // RoPE frequencies
+        rope_q_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2, half_d, N);
+        ggml_set_name(rope_q_t, "rope_q"); ggml_set_input(rope_q_t);
+        if (pd.M_spatial > 0) {
+            rope_k_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2, half_d, pd.M_spatial);
+            ggml_set_name(rope_k_t, "rope_k"); ggml_set_input(rope_k_t);
+        }
+
+        auto* conditioned = sam3_build_mem_attn_graph(ctx0, model, curr, src_pos_t,
+                                                      prompt_t, prompt_pos_t,
+                                                      rope_q_t, rope_k_t,
+                                                      pd.num_obj_ptr_tokens);
+        cond_spatial = ggml_reshape_4d(ctx0, conditioned, D, H, H, 1);
     }
-
-    auto* conditioned = sam3_build_mem_attn_graph(ctx0, model, curr, src_pos_t,
-                                                  prompt_t, prompt_pos_t,
-                                                  rope_q_t, rope_k_t,
-                                                  pd.num_obj_ptr_tokens);
-    auto* cond_spatial = ggml_reshape_4d(ctx0, conditioned, D, H, H, 1);
 
     // Bug 3 fix: single not_a_point_embed token instead of empty sparse
     auto* sparse_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, 1);
@@ -11745,12 +11788,17 @@ static sam3_prop_output sam3_propagate_single(
     }
     SAM3_TIME_END(mem_attn_alloc_ms, _t_prop_alloc);
 
-    // Upload prompt data
-    ggml_backend_tensor_set(prompt_t, pd.prompt.data(), 0, pd.prompt.size() * sizeof(float));
-    ggml_backend_tensor_set(prompt_pos_t, pd.prompt_pos.data(), 0, pd.prompt_pos.size() * sizeof(float));
-    ggml_backend_tensor_set(rope_q_t, rope_q_reord.data(), 0, rope_q_reord.size() * sizeof(float));
-    if (rope_k_t && !rope_k_data.empty())
-        ggml_backend_tensor_set(rope_k_t, rope_k_data.data(), 0, rope_k_data.size() * sizeof(float));
+    if (use_cml_ma) {
+        // Inject the CoreML mem-attn output as the decoder's conditioned input.
+        ggml_backend_tensor_set(cond_spatial, cml_cond.data(), 0, cml_cond.size() * sizeof(float));
+    } else {
+        // Upload prompt data
+        ggml_backend_tensor_set(prompt_t, pd.prompt.data(), 0, pd.prompt.size() * sizeof(float));
+        ggml_backend_tensor_set(prompt_pos_t, pd.prompt_pos.data(), 0, pd.prompt_pos.size() * sizeof(float));
+        ggml_backend_tensor_set(rope_q_t, rope_q_reord.data(), 0, rope_q_reord.size() * sizeof(float));
+        if (rope_k_t && !rope_k_data.empty())
+            ggml_backend_tensor_set(rope_k_t, rope_k_data.data(), 0, rope_k_data.size() * sizeof(float));
+    }
 
     // Set default obj_score when pred_obj_scores=False (older SAM2 models)
     if (!model.sam_dec.obj_score_token) {
@@ -11758,9 +11806,10 @@ static sam3_prop_output sam3_propagate_single(
         if (t) { float v = 10.0f; ggml_backend_tensor_set(t, &v, 0, sizeof(float)); }
     }
 
-    // Upload src_pos (sinusoidal PE 256-dim)
-    ggml_backend_tensor_set(src_pos_t, tracker.cached_sinpe_256.data(), 0,
-                            tracker.cached_sinpe_256.size() * sizeof(float));
+    // Upload src_pos (sinusoidal PE 256-dim) — ggml mem-attn path only.
+    if (src_pos_t)
+        ggml_backend_tensor_set(src_pos_t, tracker.cached_sinpe_256.data(), 0,
+                                tracker.cached_sinpe_256.size() * sizeof(float));
 
     // Upload not_a_point_embed, image_pe, dense_emb from state PE cache
     sam3_populate_pe_cache(state, model);
@@ -11772,9 +11821,11 @@ static sam3_prop_output sam3_propagate_single(
 
     // Copy tracker features from state to fresh input tensors
     {
-        std::vector<float> c2(D * N);
-        ggml_backend_tensor_get(state.neck_trk[2], c2.data(), 0, D * N * sizeof(float));
-        ggml_backend_tensor_set(curr, c2.data(), 0, D * N * sizeof(float));
+        if (curr) {  // ggml mem-attn path only (CoreML reads neck_trk[2] itself)
+            std::vector<float> c2(D * N);
+            ggml_backend_tensor_get(state.neck_trk[2], c2.data(), 0, D * N * sizeof(float));
+            ggml_backend_tensor_set(curr, c2.data(), 0, D * N * sizeof(float));
+        }
 
         std::vector<float> s0(D * H0 * H0);
         ggml_backend_tensor_get(state.neck_trk[0], s0.data(), 0, D * H0 * H0 * sizeof(float));
