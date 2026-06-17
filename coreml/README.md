@@ -95,6 +95,55 @@ projected. Reaching it in production means a pure-CoreML runtime (port the track
 glue + memory bank to the CoreML/host side; the 4 stage models are the building
 blocks, all parity-verified).
 
+## U5 threaded pipeline — MEASURED (the real-time leg, native coremltools)
+
+`audits/goldenclip-eval/pipeline_coreml_threaded.py` runs the three CoreML stages as a
+3-thread / 2-bounded-queue pipeline (`Queue(maxsize=2)`), overlapping frames across
+compute units exactly as Egor does; `encoder_compute_sweep.py` is the per-unit encoder
+benchmark. Measured on this M4 Pro.
+
+**Encoder compute-unit sweep — Egor's CPUOnly surprise does NOT reproduce here:**
+
+| unit | p50 ms |
+|---|--:|
+| CPUOnly (BNNS/AMX) | 44.6 |
+| **ANE (CPUAndNeuralEngine)** | **16.7** |
+| GPU (CPUAndGPU) | 20.4 |
+| ALL | 23.9 |
+
+On M4 Pro the ANE wins by 2.7× over CPUOnly — the reverse of his M1 Pro (where CPUOnly
+won). M4's Neural Engine is far stronger, our encoder is RepViT (conv/ANE-friendly) not
+his ViT, and native coremltools compiles the whole graph to the ANE instead of ORT's
+partitioned fallback. **Encoder stays on the ANE — validated, not a gap.**
+
+**Threaded pipeline throughput (100 frames; sequential baseline 19.1 fps):**
+
+| decoder placement | fps | speedup |
+|---|--:|--:|
+| dec → ANE (enc+dec share the ANE) | 22.5 | 1.18× |
+| **dec → GPU (best)** | **23.7** | **1.24×** |
+| dec → CPU | 20.8 | 1.09× |
+
+**The pipeline works, but the lever is ~1.24×, not Egor's 1.9×.** Direct probe: two
+concurrent predicts on different units (enc ANE ∥ mem-attn GPU) overlap only **~1.15×**,
+far below the 2× that "physically separate silicon" implies. Why: `coremltools.predict()`
+releases the GIL *only during kernel execution*; the per-call CPU-side marshalling
+(MLMultiArray alloc, input/output copy, graph orchestration) holds it, and that CPU
+portion is a large fraction of each predict — so two predicts mostly serialize on the
+CPU/GIL. Co-resident models also contend (encoder 16.7 → 20–30 ms with a second model
+loaded). Egor's 1.9× came partly from splitting out a genuinely-CPU preprocess stage
+(pure cv2/numpy, clean CPU∥accelerator overlap) that our chain doesn't have, on ORT
+(whole-`run()` GIL release) + EfficientTAM + M1 Pro.
+
+**Production caveat:** this is the *Python-harness* number. The C++/Obj-C++ bridge path
+has no GIL, can keep `MLMultiArray`s resident, and can use GCD / async `MLModel`
+prediction — it should overlap better than Python threads, but that is **unmeasured**.
+The other unmeasured lever is the decoder's **84 MB/frame** input (the 32/64-ch
+`conv_s0`/`conv_s1` shrink described below) which would lighten the heaviest stage and
+rebalance the pipeline.
+
+---
+
 ## Alignment with Egor Dmitriev's CoreML methodology (part-3)
 
 Egor's [part-3](https://egordmitriev.dev/blog/2026-05-18-optimizing-samurai-part-3)
@@ -110,24 +159,24 @@ tracker. Different substrate, same physics. Where we land vs his steps:
 | **Heterogeneous per-module compute units** | encoder→ANE, mem-attn→GPU, decoder→ANE | ✓ principle; winners differ (gap below) |
 | **FP16**, verify small accuracy cost | FP16 exports; box-jitter doesn't move `tracked_fraction` | ✓ (he: −0.012 mIoU; us: same shape) |
 | **Boundary-crossing cost dominates kernel speed** | quantified: 0.17 ms glue proves the hybrid's 6 fps was *all* ggml↔CoreML marshalling | ✓ same lesson, different boundary |
-| **3-stage threaded pipelining** (his 15.9→29.6 fps — biggest throughput lever) | **not done** — sequential chain only; this is the U5 roadmap item | ✗ the gap |
+| **3-stage threaded pipelining** (his 15.9→29.6 fps, ~1.9×) | **built + measured: 1.24×** (19.1→23.7 fps), see U5 section | ⚠ lever is far weaker on this stack |
 | runtime = **ORT CoreML EP over ONNX** | native `coremltools` + ggml hybrid | different by design |
 
-**Two gaps explain our 19 vs his 28 fps:**
-1. **Pipelining (U5).** He overlaps preprocess ∥ encoder ∥ (mem-attn+decoder) on
-   physically separate silicon via bounded queues — ~1.9× at bit-exact accuracy. Our
-   19 fps is his *pre-pipelining* regime.
-2. **CPUOnly/BNNS encoder — untested here.** His most surprising finding: the ViT
-   encoder was fastest on **CPUOnly (BNNS/AMX)**, beating both GPU and ANE (23.7 vs 29.6
-   ANE vs 44 GPU) — the encoder is ~60 tiny dispatches and dispatch overhead swamps the
-   GPU. We placed the encoder on **ANE** and never benchmarked CPUOnly. A one-line
-   `compute_units` sweep would settle it.
+**Both gaps are now MEASURED (U5 build, see the section above) — and the result corrects
+my earlier optimistic estimate:**
+1. **Pipelining yields 1.24×, not 1.9×.** Threaded 3-stage pipeline = 23.7 fps (best,
+   dec→GPU) vs 19.1 sequential. Cross-unit overlap is only ~1.15× because
+   `coremltools.predict()` holds the GIL during its CPU-side marshalling. Egor's 1.9×
+   does **not** transfer to native coremltools at the same magnitude.
+2. **The CPUOnly encoder finding does not reproduce.** On M4 Pro the encoder is fastest on
+   the **ANE** (16.7 ms), 2.7× faster than CPUOnly (44.6 ms) — the opposite of his M1 Pro.
+   Our ANE placement was already optimal here.
 
-**FPS reconciliation:** 19.1 fps (3-stage sequential, M4 Pro) ≈ his sequential regime;
-add the 4th stage (memory-encode, ~12 ms) → ~15–16 fps sequential, landing on his own
-15.4–15.9; add his pipelining (~1.9×) → ~28–30 fps. The numbers are coherent — we are at
-his pre-pipelining stage on a faster chip, and the remaining distance to real-time is
-exactly the pipelining step (plus the 4th-stage export).
+**Corrected FPS reconciliation:** 19.1 fps sequential → **23.7 fps pipelined (measured,
+3 stages)**. Egor's 28–30 came from a ~1.9× pipelining lever that this stack does not get.
+Closing the rest is *unmeasured* work, not a free pipelining step: a GIL-free C++ pipeline,
+the 32/64-ch decoder-input shrink, and the 4th-stage (memory-encode) export. My earlier
+"≈1.9× → 28–30" line was wrong on measurement; the real lever here is 1.24×.
 
 Two corrections from reading the post: part-3 is **plain FP16** (the attention-in-FP32
 mixed-precision was part-2 / TensorRT), and part-3 leans on **CPU/GPU, not the ANE** (he
