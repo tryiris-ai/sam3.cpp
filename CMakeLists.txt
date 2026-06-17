@@ -47,11 +47,16 @@ endif()
 if(APPLE)
     option(SAM3_COREML "Build the CoreML/ANE EdgeTAM encoder bridge" OFF)
     if(SAM3_COREML)
-        # Enable Objective-C++ HERE (after add_subdirectory(ggml)) — enabling it
-        # earlier makes ggml's Metal .m files compile as C++ and breaks them.
-        enable_language(OBJCXX)
+        # Compile the Objective-C++ bridge as CXX with -x objective-c++ rather than
+        # enable_language(OBJCXX). The latter (a) must sit after add_subdirectory(ggml)
+        # or it reclassifies ggml's Metal .m files as C++ and breaks them, and (b) under
+        # CMake 4.x, enabled in this conditional sub-scope, fails to emit a
+        # CMAKE_OBJCXX_COMPILE_OBJECT rule ("cmake may not be built correctly"). Treating
+        # the single .mm as CXX+objective-c++ sidesteps both and never touches ggml.
         target_sources(sam3 PRIVATE coreml/edgetam_coreml.mm)
-        set_source_files_properties(coreml/edgetam_coreml.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        set_source_files_properties(coreml/edgetam_coreml.mm PROPERTIES
+            LANGUAGE CXX
+            COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
         target_include_directories(sam3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/coreml)
         target_compile_definitions(sam3 PUBLIC SAM3_COREML)
         target_link_libraries(sam3 PUBLIC "-framework CoreML" "-framework Foundation")

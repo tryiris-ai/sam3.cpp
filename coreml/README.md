@@ -104,10 +104,15 @@ to run (ANE/GPU contention back-to-back), but the throughput is real.
 **Bottom line:** the **hybrid (6.1 fps)** is the validated, accuracy-held config shipping
 in this PR (CoreML stages bolted onto the proven ggml tracker). The **pure-CoreML pipeline
 (20.3 fps full 4-stage sequential / 23.7 fps threaded-3-stage)** is *measured*
-(`bench/pipeline_coreml*.py`), and sets the target for the production **pure-CoreML C++
-runtime** that reaches Egor's ~28-30 fps — designed in `coreml/RUNTIME.md` (a separate PR:
-it ports the tracker glue + memory bank off ggml). **All 4 stage models are now exported and
-parity-verified** (encoder 0.992, mem-attn 1.000, decoder 0.999, memory-encode 1.000).
+(`bench/pipeline_coreml*.py`). The **C++ runtime core** is now **built + measured**
+(`examples/sam3_coreml_pipeline.cpp`): no-GIL threading reaches **~15-20 fps sustained
+(~27 cold)** and is **placement-critical** — encoder ANE ∥ consumer all-GPU gives a 1.1-1.35×
+threaded speedup, but putting 3 stages on the ANE makes threading *regress to 0.62×*. It does
+**not** yet hold a stable 28-30; the GIL was not the dominant cap (per-frame ANE↔GPU
+switching + thermal + CPU-marshalling contention are). See `coreml/RUNTIME.md` for the
+findings + remaining levers (resident buffers, fewer unit transitions, host-side memory bank,
+cgo). **All 4 stage models are exported + parity-verified** (encoder 0.992, mem-attn 1.000,
+decoder 0.999, memory-encode 1.000).
 
 ## U5 threaded pipeline — MEASURED (the real-time leg, native coremltools)
 

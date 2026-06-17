@@ -19,6 +19,15 @@ add_executable(sam3_edgetam_bench sam3_edgetam_bench.cpp)
 target_link_libraries(sam3_edgetam_bench PRIVATE sam3)
 target_compile_definitions(sam3_edgetam_bench PRIVATE SAM3_TIMING)
 
+# RFD 0011 (pure-CoreML C++ runtime core): 4-stage encoder-ahead threaded pipeline
+# that measures the no-GIL throughput thesis from coreml/RUNTIME.md. Needs the
+# CoreML bridge (links sam3, which carries it under SAM3_COREML), so it only builds
+# when SAM3_COREML is ON.
+if(SAM3_COREML)
+    add_executable(sam3_coreml_pipeline sam3_coreml_pipeline.cpp)
+    target_link_libraries(sam3_coreml_pipeline PRIVATE sam3)
+endif()
+
 # SDL2 + ImGui are optional — build only if SDL2 is found.
 find_package(SDL2 QUIET)
 

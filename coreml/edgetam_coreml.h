@@ -60,6 +60,17 @@ int edgetam_coreml_decode(edgetam_coreml_handle h,
                           const float* feat_s0, const float* feat_s1,
                           float* masks, float* iou_pred, float* obj_score, float* mask_tokens);
 
+// Run the memory-encode model (memory_encoder + spatial_perceiver; a separate
+// handle/model). Inputs f32 contiguous: pix_feat [1,256,64,64] (the encoder's
+// top-level 64x64 feature, BCHW) and mask_logits [1,1,1024,1024] (the decoder's
+// full-res mask). Outputs (caller pre-allocates 512*64 floats each): mem_feats
+// the 512 compressed memory latents [1,512,64], mem_pos their position encoding
+// [1,512,64] — exactly what one new slot of the mem-attn memory bank consumes.
+// Exported with parity cosine 1.000000; ~5 ms on ANE/GPU. Returns 1 on success.
+int edgetam_coreml_memencode(edgetam_coreml_handle h,
+                             const float* pix_feat, const float* mask_logits,
+                             float* mem_feats, float* mem_pos);
+
 void edgetam_coreml_destroy(edgetam_coreml_handle h);
 
 #ifdef __cplusplus

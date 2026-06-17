@@ -198,6 +198,41 @@ int edgetam_coreml_decode(edgetam_coreml_handle handle,
     }
 }
 
+int edgetam_coreml_memencode(edgetam_coreml_handle handle,
+                             const float* pix_feat, const float* mask_logits,
+                             float* mem_feats, float* mem_pos) {
+    @autoreleasepool {
+        auto* h = (EdgetamCoreML*)handle;
+        if (!h || !h->model) return 0;
+        NSError* err = nil;
+        auto mk = [&](const float* data, NSArray<NSNumber*>* shape, size_t n) -> MLMultiArray* {
+            MLMultiArray* a = [[MLMultiArray alloc] initWithShape:shape
+                                                         dataType:MLMultiArrayDataTypeFloat32 error:&err];
+            if (a) memcpy(a.dataPointer, data, sizeof(float) * n);
+            return a;
+        };
+        // pix_feat [1,256,64,64] BCHW, mask_logits [1,1,1024,1024] — same layouts the
+        // export traced, so each is a direct memcpy into the MLMultiArray.
+        MLMultiArray* pf = mk(pix_feat,    @[@1,@256,@64,@64],   (size_t)256*64*64);
+        MLMultiArray* ml = mk(mask_logits, @[@1,@1,@1024,@1024], (size_t)1024*1024);
+        if (!pf || !ml) { NSLog(@"[edgetam_coreml] memencode input alloc: %@", err); return 0; }
+
+        MLDictionaryFeatureProvider* fp =
+            [[MLDictionaryFeatureProvider alloc]
+                initWithDictionary:@{@"pix_feat":    [MLFeatureValue featureValueWithMultiArray:pf],
+                                     @"mask_logits": [MLFeatureValue featureValueWithMultiArray:ml]}
+                             error:&err];
+        if (err || !fp) { NSLog(@"[edgetam_coreml] memencode feature provider: %@", err); return 0; }
+
+        id<MLFeatureProvider> out = [h->model predictionFromFeatures:fp error:&err];
+        if (err || !out) { NSLog(@"[edgetam_coreml] memencode predict: %@", err); return 0; }
+        // Tuple output flattened to var_486 (latents) + var_488 (pos), each [1,512,64].
+        bool ok = copy_f32([[out featureValueForName:@"var_486"] multiArrayValue], mem_feats, (size_t)512*64)
+               && copy_f32([[out featureValueForName:@"var_488"] multiArrayValue], mem_pos,   (size_t)512*64);
+        return ok ? 1 : 0;
+    }
+}
+
 void edgetam_coreml_destroy(edgetam_coreml_handle handle) {
     auto* h = (EdgetamCoreML*)handle;
     if (h) { h->model = nil; delete h; }
