@@ -55,13 +55,20 @@ SAM3_COREML_MEMATTN=1 SAM3_COREML_MEMATTN_MODEL=<...>/edgetam_memory_attention.m
   `SAM3_COREML` CMake option (Apple-only, OFF by default; default builds
   unaffected) + runtime env gates `SAM3_COREML_ENCODER` / `SAM3_COREML_MEMATTN`.
 
-## How the CoreML models are produced (external, in the eval repo)
-`~/iris/audits/goldenclip-eval/`:
-- encoder: export `neck(trunk(x))[0:3]` channels-last via the freeze trick
+## How the CoreML models are produced (tooling vendored under `coreml/`)
+`coreml/export/` produces the models, `coreml/bench/` measures them (see
+`coreml/bench/README.md`; set `SAM3_GE_DIR` to your eval dir for the EdgeTAM ckpt):
+- encoder: `neck(trunk(x))[0:3]` channels-last via the freeze trick
   (`torch.jit.freeze` + `run_frozen_optimizations` before `ct.convert`).
   → `edgetam_encoder_neck_nhwc.mlpackage`.
-- memory attention: `convert_memattn_coreml.py` (real-valued RoPE + constant-shape
+- memory attention: `export/convert_memattn_coreml.py` (real-valued RoPE + constant-shape
   reshapes + rank-≤5 k-rope). → `edgetam_memory_attention.mlpackage`.
+- mask decoder: `export/convert_maskdec_coreml_nhwc.py` (channels-last NHWC).
+  → `edgetam_mask_decoder_nhwc.mlpackage`.
+- memory-encode (stage 4): `export/convert_memenc_coreml.py` — constant-shape perceiver
+  windowing + injected constant PEs, **parity-verified but `ct.convert` still blocked on
+  one residual `aten::Int`**. The only un-exported stage; see `coreml/RUNTIME.md` for the
+  turnkey finish and why its CoreML speed is load-bearing for the real-time runtime.
 
 ## Pure-CoreML pipeline — MEASURED 19 fps (the real-time path)
 
@@ -88,12 +95,13 @@ solvable) lands the full tracker at **~15–16 fps** — matching the EdgeTAM-pa
 PABannier "15–20 on M-series" figure. Per-stage times run a bit higher than
 isolated (ANE/GPU contention back-to-back), but the throughput is real.
 
-**Bottom line:** the **hybrid (6.1 fps)** is the validated, accuracy-held config
-shipping in this PR (CoreML stages bolted onto the proven ggml tracker). The
-**pure-CoreML pipeline (~15–19 fps)** is the real-time path — now *measured*, not
-projected. Reaching it in production means a pure-CoreML runtime (port the tracker
-glue + memory bank to the CoreML/host side; the 4 stage models are the building
-blocks, all parity-verified).
+**Bottom line:** the **hybrid (6.1 fps)** is the validated, accuracy-held config shipping
+in this PR (CoreML stages bolted onto the proven ggml tracker). The **pure-CoreML pipeline
+(19 fps sequential / 23.7 fps threaded)** is *measured* (`bench/pipeline_coreml*.py`), and
+sets the target for the production **pure-CoreML C++ runtime** that reaches Egor's ~28-30
+fps — designed in `coreml/RUNTIME.md` (a separate PR: it ports the tracker glue + memory
+bank off ggml and needs the stage-4 export finished). 3 of 4 stage models are
+parity-verified; the 4th (memory-encode) is plumbing away.
 
 ## U5 threaded pipeline — MEASURED (the real-time leg, native coremltools)
 
