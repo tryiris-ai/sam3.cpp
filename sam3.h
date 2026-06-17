@@ -58,6 +58,20 @@ struct sam3_box {
     float y1;  // bottom-right y
 };
 
+// RFD 0011 U2: bbox derived directly from the EdgeTAM mask decoder's
+// LOW-RES logit grid (mask_w x mask_h, ~256x256), scaled to original-frame
+// pixel corners. The full-resolution mask->bbox scan was the per-frame
+// sync-killer (~11.7ms: a 2M-pixel min/max scan + hole/sprinkle postproc per
+// instance). Scanning the fixed ~64K low-res grid instead is ~60x less work
+// and avoids the variable-length nonzero-style pass. `valid` is false when the
+// foreground area_ratio (fg / (mask_w*mask_h)) is degenerate (no foreground,
+// too small, or near-full-frame), so the caller can fall back / skip.
+struct LowResMaskBox {
+    bool  valid = false;
+    float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;  // original-frame pixel corners
+    float area_ratio = 0.0f;                            // fg cells / total cells
+};
+
 struct sam3_image {
     int width    = 0;
     int height   = 0;
@@ -74,6 +88,27 @@ struct sam3_mask {
     std::vector<uint8_t> data;  // binary mask (0 or 255)
 };
 
+// RFD 0011 U4: explicit tracker lifecycle state. All six states are DEFINED to
+// match the RFD 0011 contract and for forward-compatibility, but only the four
+// reachable states (TRACKED / AT_RISK / OCCLUDED / LOST) have transition logic
+// in this PR. CANDIDATE_REACQUIRE and REACQUIRED are entered only once an
+// appearance re-ID reacquire mechanism lands (RFD 0011 U6 / OSNet, roadmap) —
+// there is no driver for them here, so they are reserved, not dead live enums.
+// Design intent: "fail-lost, not fail-wrong" — ambiguous frames degrade to
+// AT_RISK / OCCLUDED and persistent loss becomes LOST, rather than reporting a
+// confident wrong-person track.
+enum class TargetState {
+    TRACKED,             // mask, motion, and objectness all agree
+    AT_RISK,             // a plausible target, but >=1 signal is degrading
+    OCCLUDED,            // target likely hidden; no credible mask this frame
+    LOST,                // no reliable target; do not chase (terminal until U6 reacquire)
+    CANDIDATE_REACQUIRE, // reserved — U6 (re-ID proposes a candidate)
+    REACQUIRED           // reserved — U6 (candidate confirmed)
+};
+
+// Human-readable lowercase name (also used in the bench JSON `state` field).
+const char* sam3_target_state_name(TargetState s);
+
 struct sam3_detection {
     sam3_box  box;
     float     score     = 0.0f;
@@ -81,6 +116,7 @@ struct sam3_detection {
     int       instance_id = -1;
     sam3_mask  mask;
     std::vector<float> sam_token;  // raw SAM decoder output token (for obj_ptr)
+    TargetState state   = TargetState::TRACKED;  // RFD 0011 U4: lifecycle state
 };
 
 struct sam3_result {
@@ -300,6 +336,21 @@ sam3_result sam3_propagate_frame(
     const sam3_image & frame);
 
 /*
+** RFD 0011 U2 — derive a control bbox directly from the EdgeTAM mask
+** decoder's LOW-RES logit grid, skipping the full-resolution upsample +
+** min/max scan that dominated mask_to_bbox_ms. Iterates the fixed
+** mask_w*mask_h grid (no full-res allocation, no variable-length coord
+** arrays), thresholds logits (threshold=0.0f == sigmoid>0.5, matching the
+** existing full-res path), and scales the foreground cell extent to src
+** (original-frame) pixel corners. Returns valid=false when area_ratio is
+** degenerate. Exposed for the bench / debug tooling.
+*/
+LowResMaskBox bbox_from_lowres_mask(const float * mask_logits,
+                                    int mask_w, int mask_h,
+                                    int src_w, int src_h,
+                                    float threshold);
+
+/*
 ** ── Utility ─────────────────────────────────────────────────────────────
 */
 
@@ -517,3 +568,70 @@ bool sam3_profile_edgetam_encode(const sam3_model & model,
                                  int                n_threads = 4,
                                  int                n_warmup  = 2,
                                  int                n_iter    = 5);
+
+/*
+** ── Per-frame "hold" timing (RFD 0011 U0) ────────────────────────────────
+**
+** Fine-grained, per-frame latency breakdown of the EdgeTAM video tracker's
+** steady-state "hold" loop (encode image -> propagate -> encode memory).
+**
+** WHY THE BUILD/ALLOC/COMPUTE SPLIT MATTERS:
+** Each per-frame stage that builds a fresh ggml graph is measured as THREE
+** separate numbers — graph construction (build), gallocr reserve+alloc
+** (alloc), and backend compute (compute) — NOT one lumped total. RFD 0011
+** unit U1 eliminates the per-frame graph rebuild; its acceptance criterion is
+** "build_ms + alloc_ms ≈ 0 in steady state". If build+alloc+compute were
+** lumped together, U1 would be unverifiable. So every graph-building stage
+** here exposes its three components independently.
+**
+** All fields are wall-clock milliseconds for ONE frame. Stages that run once
+** per tracked instance per frame (propagation, memory encode) accumulate
+** across instances; with a single tracked instance (the bench default) the
+** accumulation is exactly one call. Fields that are not separable on a given
+** path are documented inline and reported as 0.
+**
+** Instrumentation is compiled in only when the sam3 library is built with
+** -DSAM3_TIMING. When that flag is absent the timers are zero-overhead and
+** sam3_take_frame_timing() returns an all-zero struct.
+*/
+struct HoldFrameTiming {
+    double preprocess_ms = 0.0;            // image preprocessing (resize + normalize)
+
+    double image_encoder_build_ms   = 0.0; // RepViT+FPN graph construction
+    double image_encoder_alloc_ms   = 0.0; // gallocr reserve + alloc_graph
+    double image_encoder_compute_ms = 0.0; // backend compute of the image encoder
+
+    // Propagation: memory-attention + SAM mask decoder share ONE ggml graph
+    // (sam3_propagate_single builds mem-attn and the mask decoder into the
+    // same cgraph and computes once), so mem_attn_compute_ms below holds the
+    // COMBINED mem-attn + mask-decoder compute time. See mask_decoder_compute_ms.
+    double mem_attn_build_ms   = 0.0;      // mem-attn + mask-decoder graph construction
+    double mem_attn_alloc_ms   = 0.0;      // gallocr reserve + alloc_graph
+    double mem_attn_compute_ms = 0.0;      // backend compute (mem-attn + mask decoder)
+
+    // The EdgeTAM propagation path fuses the memory-attention and SAM mask
+    // decoder into a single shared graph, so the mask decoder's compute time
+    // is NOT separable from mem-attn. It is folded into mem_attn_compute_ms and
+    // this field is always 0 on the EdgeTAM hold path (kept for API symmetry /
+    // future paths where the decoder is a distinct graph).
+    double mask_decoder_compute_ms = 0.0;
+
+    double mem_encoder_build_ms   = 0.0;   // memory-encoder graph construction
+    double mem_encoder_alloc_ms   = 0.0;   // gallocr reserve + alloc_graph
+    double mem_encoder_compute_ms = 0.0;   // backend compute of the memory encoder
+
+    double memory_bank_update_ms = 0.0;    // perceiver compress + memory-slot store
+    double mask_to_bbox_ms       = 0.0;    // mask -> bbox extraction for the result
+    double state_update_ms       = 0.0;    // tracker confirmation/eviction + state copy
+
+    double total_ms = 0.0;                 // whole-frame wall time
+};
+
+/*
+** Fetch the timing record accumulated for the most recent frame and RESET the
+** internal accumulator to zero, ready for the next frame. Call once per frame
+** immediately after sam3_propagate_frame / sam3_track_frame returns.
+**
+** Returns an all-zero struct when the library was built without -DSAM3_TIMING.
+*/
+HoldFrameTiming sam3_take_frame_timing();
