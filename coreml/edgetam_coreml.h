@@ -46,6 +46,20 @@ int edgetam_coreml_memattn(edgetam_coreml_handle h,
                            const float* curr_pos, const float* memory_pos,
                            float* conditioned);
 
+// Run the SAM mask decoder (a separate handle/model). All inputs are f32
+// CHANNELS-LAST [1,H,W,C], byte-identical to ggml's channels-inner buffers, so
+// the caller passes them directly:
+//   image_embeddings,image_pe,dense: 256*64*64 ; sparse: 256 ;
+//   feat_s0: 256*256*256 ; feat_s1: 256*128*128.
+// Outputs (caller pre-allocates): masks 4*256*256 (4 low-res mask logits),
+//   iou_pred 4, obj_score 1, mask_tokens 4*256 (per-mask SAM tokens). The caller
+//   does the multimask selection (best of 4 by IoU). Returns 1 on success.
+int edgetam_coreml_decode(edgetam_coreml_handle h,
+                          const float* image_embeddings, const float* image_pe,
+                          const float* sparse, const float* dense,
+                          const float* feat_s0, const float* feat_s1,
+                          float* masks, float* iou_pred, float* obj_score, float* mask_tokens);
+
 void edgetam_coreml_destroy(edgetam_coreml_handle h);
 
 #ifdef __cplusplus

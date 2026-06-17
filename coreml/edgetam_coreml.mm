@@ -153,6 +153,51 @@ int edgetam_coreml_memattn(edgetam_coreml_handle handle,
     }
 }
 
+int edgetam_coreml_decode(edgetam_coreml_handle handle,
+                          const float* image_embeddings, const float* image_pe,
+                          const float* sparse, const float* dense,
+                          const float* feat_s0, const float* feat_s1,
+                          float* masks, float* iou_pred, float* obj_score, float* mask_tokens) {
+    @autoreleasepool {
+        auto* h = (EdgetamCoreML*)handle;
+        if (!h || !h->model) return 0;
+        NSError* err = nil;
+        // Channels-last [1,H,W,C] inputs == ggml channels-inner buffers (memcpy).
+        auto mk = [&](const float* data, NSArray<NSNumber*>* shape, size_t n) -> MLMultiArray* {
+            MLMultiArray* a = [[MLMultiArray alloc] initWithShape:shape
+                                                         dataType:MLMultiArrayDataTypeFloat32 error:&err];
+            if (a) memcpy(a.dataPointer, data, sizeof(float) * n);
+            return a;
+        };
+        MLMultiArray* ie = mk(image_embeddings, @[@1,@64,@64,@256],   (size_t)256*64*64);
+        MLMultiArray* pe = mk(image_pe,         @[@1,@64,@64,@256],   (size_t)256*64*64);
+        MLMultiArray* sp = mk(sparse,           @[@1,@1,@256],        (size_t)256);
+        MLMultiArray* de = mk(dense,            @[@1,@64,@64,@256],   (size_t)256*64*64);
+        MLMultiArray* f0 = mk(feat_s0,          @[@1,@256,@256,@256], (size_t)256*256*256);
+        MLMultiArray* f1 = mk(feat_s1,          @[@1,@128,@128,@256], (size_t)256*128*128);
+        if (!ie||!pe||!sp||!de||!f0||!f1) { NSLog(@"[edgetam_coreml] decode input alloc: %@", err); return 0; }
+
+        MLDictionaryFeatureProvider* fp =
+            [[MLDictionaryFeatureProvider alloc]
+                initWithDictionary:@{@"image_embeddings":[MLFeatureValue featureValueWithMultiArray:ie],
+                                     @"image_pe":        [MLFeatureValue featureValueWithMultiArray:pe],
+                                     @"sparse":          [MLFeatureValue featureValueWithMultiArray:sp],
+                                     @"dense":           [MLFeatureValue featureValueWithMultiArray:de],
+                                     @"feat_s0":         [MLFeatureValue featureValueWithMultiArray:f0],
+                                     @"feat_s1":         [MLFeatureValue featureValueWithMultiArray:f1]}
+                             error:&err];
+        if (err || !fp) { NSLog(@"[edgetam_coreml] decode feature provider: %@", err); return 0; }
+
+        id<MLFeatureProvider> out = [h->model predictionFromFeatures:fp error:&err];
+        if (err || !out) { NSLog(@"[edgetam_coreml] decode predict: %@", err); return 0; }
+        bool ok = copy_f32([[out featureValueForName:@"masks"]       multiArrayValue], masks,       (size_t)4*256*256)
+               && copy_f32([[out featureValueForName:@"iou_pred"]    multiArrayValue], iou_pred,    4)
+               && copy_f32([[out featureValueForName:@"obj_score"]   multiArrayValue], obj_score,   1)
+               && copy_f32([[out featureValueForName:@"mask_tokens"] multiArrayValue], mask_tokens, (size_t)4*256);
+        return ok ? 1 : 0;
+    }
+}
+
 void edgetam_coreml_destroy(edgetam_coreml_handle handle) {
     auto* h = (EdgetamCoreML*)handle;
     if (h) { h->model = nil; delete h; }

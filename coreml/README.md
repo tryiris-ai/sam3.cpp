@@ -63,9 +63,28 @@ SAM3_COREML_MEMATTN=1 SAM3_COREML_MEMATTN_MODEL=<...>/edgetam_memory_attention.m
 - memory attention: `convert_memattn_coreml.py` (real-valued RoPE + constant-shape
   reshapes + rank-≤5 k-rope). → `edgetam_memory_attention.mlpackage`.
 
-## Remaining for full ~15 fps
-With both legs the frame is ~164 ms (6.1 fps): encoder 11 (ANE) + mem-attn 18
-(GPU) + **mask decoder ~80 (ggml)** + memory-encode ~24 (ggml) + overhead. The
-**mask decoder is now the bottleneck** — it shares the propagation graph with the
-mem-attn and was not separately exported. Moving the decoder (and memory-encode)
-to CoreML is the remaining step toward the EdgeTAM-paper 15 fps.
+## Decoder leg — explored; transfer-bound, NOT recommended (2-leg is optimal)
+A third leg (CoreML mask decoder, `SAM3_COREML_DECODER`) is implemented and
+**functionally correct** (goldeneval dt0004 0.913, tracks, wrong-person 0), but it
+is a **net regression** and is OFF by default:
+
+| config | fps | dt0004 |
+|---|--:|--:|
+| **2 legs (encoder + mem-attn)** | **6.11** | **0.939** |
+| 3 legs (+ decoder) | 2.62–5.0 | 0.913 |
+
+Why: the decoder *compute* is fast on CoreML (80 ms ggml → ~11 ms, export parity
+0.999), but its **256-ch high-res inputs are ~84 MB/frame** (`feat_s0` 67 MB +
+`feat_s1` 17 MB). CoreML's `predict()` copies inputs to the compute device every
+call, and that transfer costs more than the ggml decoder — which keeps those
+features on-device. So moving the decoder out trades a cheap on-device op for an
+expensive host→device copy. The slight accuracy dip is extra FP16 compounding.
+
+**The fix (the real remaining work):** feed the decoder **32/64-ch** high-res
+features (apply the decoder's `conv_s0`/`conv_s1` 256→32/64 inside the *encoder*
+export) → ~13 MB/frame instead of 84 MB. Or fuse encoder+decoder into one CoreML
+graph so the high-res features never leave the device. Either makes the decoder a
+real win and, with memory-encode, lands the EdgeTAM-paper ~15 fps. The decoder
+export + bridge + integration here are the reusable building blocks for that.
+
+**Recommended config: 2 legs (encoder ANE + mem-attn GPU) — 6.11 fps, accuracy held.**

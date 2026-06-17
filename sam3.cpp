@@ -11682,6 +11682,53 @@ static sam3_prop_output sam3_propagate_single(
             SAM3_TIME_END(mem_attn_compute_ms, _t_cml_ma);
         }
     }
+
+    // RFD 0011 (CoreML/ANE hybrid): FULL-CoreML propagation. When the mem-attn
+    // ran on CoreML AND the decoder is enabled, run the CoreML mask decoder too
+    // and RETURN — propagate_single does ZERO ggml graph work (the whole frame is
+    // encode ~11ms ANE + mem-attn ~18ms GPU + decoder ~6ms ANE). Decoder inputs
+    // are channels-last, byte-identical to ggml's channels-inner buffers (memcpy).
+    static edgetam_coreml_handle s_decoder = nullptr;
+    static bool s_decoder_tried = false;
+    if (use_cml_ma && getenv("SAM3_COREML_DECODER")) {
+        if (!s_decoder && !s_decoder_tried) {
+            s_decoder_tried = true;
+            const char* mp = getenv("SAM3_COREML_DECODER_MODEL");
+            if (mp) {
+                s_decoder = edgetam_coreml_create(mp, /*CPU_AND_NE*/ 1);
+                if (s_decoder) fprintf(stderr, "%s: CoreML decoder loaded (ANE): %s\n", __func__, mp);
+            }
+        }
+        if (s_decoder) {
+            sam3_populate_pe_cache(state, model);
+            const int H0 = H * 4, H1 = H * 2;
+            std::vector<float> f0((size_t)D * H0 * H0), f1((size_t)D * H1 * H1);
+            ggml_backend_tensor_get(state.neck_trk[0], f0.data(), 0, f0.size() * sizeof(float));
+            ggml_backend_tensor_get(state.neck_trk[1], f1.data(), 0, f1.size() * sizeof(float));
+            std::vector<float> dmasks((size_t)4 * 256 * 256), diou(4), dtok((size_t)4 * D);
+            float dobj = 0.0f;
+            SAM3_TIME_BEGIN(_t_cml_dec);
+            bool dok = edgetam_coreml_decode(s_decoder, cml_cond.data(),
+                          state.dense_pe_cache.data(), state.not_a_point_cache,
+                          state.dense_nomask_cache.data(), f0.data(), f1.data(),
+                          dmasks.data(), diou.data(), &dobj, dtok.data());
+            SAM3_TIME_END(mask_decoder_compute_ms, _t_cml_dec);
+            if (dok) {
+                // Multimask selection (best of tokens 1-3 by IoU) — identical to
+                // the ggml post-processing below.
+                int best = 1; float biou = diou[1];
+                for (int m = 2; m < 4; ++m) if (diou[m] > biou) { biou = diou[m]; best = m; }
+                const int mhw = H * 4;  // 256
+                output.n_masks = 1; output.mask_h = mhw; output.mask_w = mhw;
+                output.mask_logits.assign(dmasks.begin() + (size_t)best * mhw * mhw,
+                                          dmasks.begin() + (size_t)(best + 1) * mhw * mhw);
+                output.iou_scores.assign(1, biou);
+                output.obj_score = dobj;
+                output.sam_token.assign(dtok.begin() + (size_t)best * D, dtok.begin() + (size_t)(best + 1) * D);
+                return output;  // no ggml graph at all
+            }
+        }
+    }
 #endif
 
     // ── Build graph ─────────────────────────────────────────────────────
