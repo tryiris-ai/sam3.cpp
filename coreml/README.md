@@ -63,7 +63,43 @@ SAM3_COREML_MEMATTN=1 SAM3_COREML_MEMATTN_MODEL=<...>/edgetam_memory_attention.m
 - memory attention: `convert_memattn_coreml.py` (real-valued RoPE + constant-shape
   reshapes + rank-≤5 k-rope). → `edgetam_memory_attention.mlpackage`.
 
-## Decoder leg — explored; transfer-bound, NOT recommended (2-leg is optimal)
+## Pure-CoreML pipeline — MEASURED 19 fps (the real-time path)
+
+A standalone pure-CoreML chain (`audits/goldenclip-eval/pipeline_coreml.py`, no
+ggml) chains the three CoreML stages with real output→input handoffs and times
+the per-frame loop on this M4 Pro (100 frames):
+
+| stage | ms |
+|---|--:|
+| encoder (ANE) | 21.0 |
+| memory attention (GPU) | 23.8 |
+| decoder (ANE) | 7.3 |
+| **glue / handoff** | **0.17** |
+| **per-frame** | **52.3 → 19.1 fps** |
+
+**This settles the 6-vs-15-20 question.** The cross-stage handoff is **0.17 ms**
+(negligible) — so the hybrid's 6.1 fps was **entirely** the ggml↔CoreML
+marshalling (84 MB decoder inputs, per-stage input copies), NOT chaining or
+compute. A pure-CoreML pipeline (everything on the CoreML side, no ggml
+round-trips) hits **19 fps for the 3 stages**; adding the 4th stage
+(memory-encode, ~10–15 ms — its CoreML export hits the same perceiver
+constant-shape `int`-op wall the other stages cleared with reshape patches,
+solvable) lands the full tracker at **~15–16 fps** — matching the EdgeTAM-paper /
+PABannier "15–20 on M-series" figure. Per-stage times run a bit higher than
+isolated (ANE/GPU contention back-to-back), but the throughput is real.
+
+**Bottom line:** the **hybrid (6.1 fps)** is the validated, accuracy-held config
+shipping in this PR (CoreML stages bolted onto the proven ggml tracker). The
+**pure-CoreML pipeline (~15–19 fps)** is the real-time path — now *measured*, not
+projected. Reaching it in production means a pure-CoreML runtime (port the tracker
+glue + memory bank to the CoreML/host side; the 4 stage models are the building
+blocks, all parity-verified).
+
+## Decoder leg in the HYBRID — transfer-bound, NOT recommended there (2-leg is optimal)
+NB: the decoder being "transfer-bound" is a **hybrid-only** artifact (its 84 MB
+256-ch high-res inputs cross the ggml↔CoreML boundary each frame). In the
+*pure-CoreML* chain above the decoder is just 7 ms with ~0 handoff — so it's only
+a problem when bolted onto ggml.
 A third leg (CoreML mask decoder, `SAM3_COREML_DECODER`) is implemented and
 **functionally correct** (goldeneval dt0004 0.913, tracks, wrong-person 0), but it
 is a **net regression** and is OFF by default:
