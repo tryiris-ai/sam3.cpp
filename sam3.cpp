@@ -12108,13 +12108,19 @@ static bool sam3_encode_memory(
     auto m_hires = sam3_bilinear_interpolate(mask_logits, mask_w, mask_h, HIGH_RES, HIGH_RES);
 #ifdef SAM3_COREML
     // RFD 0011 U8 Wave 1: CoreML memory-encode (memory_encoder + spatial_perceiver,
-    // ~6ms ANE vs ~24ms ggml). ⚠️ WIP — SPEED VERIFIED (7.8→10.86 fps, mem_encoder
-    // 24→0ms) but ACCURACY BROKEN (goldeneval dt0004 0.000, 107 lost): the slot the
-    // model produces here mismatches the ggml perceiver slot — a pix_feat (HWC→BCHW)
-    // or mask-input layout-parity bug in the seed/conditioning slot. FIX: dump this
-    // path's mfeat/mpos vs edgetam_perceiver_forward's perc_latents/perc_pos for one
-    // frame and cosine-compare to find the wrong axis. Gated OFF by default (env
-    // SAM3_COREML_MEMENC), so the ggml memencode below remains the correct path.
+    // ~6ms ANE vs ~24ms ggml). ⚠️ DO NOT USE IN THE ggml-ORCHESTRATED TRACKER.
+    // SPEED VERIFIED (7.8→10.86 fps, mem_encoder 24→0ms) but ACCURACY BROKEN
+    // (goldeneval dt0004 0.000). DIAGNOSED via the parity probe below: vs the ggml
+    // edgetam_perceiver_forward slot, pos cos=1.000 but **feats cos≈0.85** on
+    // IDENTICAL pix_feat+mask (pix_feat HWC→BCHW transpose verified — the H/W-swapped
+    // variant scores 0.43, far worse; mask sigmoid/scale is not the driver). So the
+    // gap is a genuine REPRESENTATION difference between the ggml perceiver and the
+    // CoreML spatial_perceiver (different magnitudes). The ggml assembly + tpos +
+    // mem-attn are calibrated to the ggml representation, so a 0.85-different slot
+    // breaks the track. CONCLUSION: 20fps needs a FULLY pure-CoreML tracker (the
+    // sam3_coreml_pipeline path + a real bank + ggml-seed), not this hybrid drop-in.
+    // Gated OFF by default (env SAM3_COREML_MEMENC); the ggml memencode below is the
+    // correct path for the hybrid.
     // The exported model applies the mask sigmoid internally
     // (convert_memenc_coreml.py: skip_mask_sigmoid=False), so it takes RAW logits at
     // HIGH_RES — i.e. m_hires BEFORE the sigmoid below. pix_feat is neck2 transposed
@@ -12307,8 +12313,48 @@ static bool sam3_encode_memory(
             return false;
         }
 
-        // Store perceiver output: [MD=64, N_perc] (N_1d + N_2d latents)
         const int N_perc = hp.perceiver_n_latents_1d + hp.perceiver_n_latents_2d;
+#ifdef SAM3_COREML
+        // RFD 0011 U8 Wave 1: memencode parity probe. Run the ggml path AND set
+        // SAM3_COREML_MEMENC_PARITY(+_MODEL) to cosine-compare the CoreML memencode
+        // slot against this ggml perceiver slot, per axis, to find the wrong one.
+        if (getenv("SAM3_COREML_MEMENC_PARITY")) {
+            static edgetam_coreml_handle s_pe = nullptr;
+            static bool s_pe_tried = false;
+            if (!s_pe && !s_pe_tried) {
+                s_pe_tried = true;
+                const char* mp = getenv("SAM3_COREML_MEMENC_MODEL");
+                if (mp) s_pe = edgetam_coreml_create(mp, 1);
+            }
+            if (s_pe) {
+                auto raw = sam3_bilinear_interpolate(mask_logits, mask_w, mask_h, HIGH_RES, HIGH_RES);
+                std::vector<float> n2((size_t)D * H * H), pc((size_t)D * H * H);
+                ggml_backend_tensor_get(state.neck_trk[2], n2.data(), 0, (size_t)D * H * H * sizeof(float));
+                for (int hh = 0; hh < H; ++hh)
+                    for (int ww = 0; ww < H; ++ww)
+                        for (int cc = 0; cc < D; ++cc)
+                            pc[(size_t)cc * H * H + (size_t)hh * H + ww] = n2[(size_t)cc + ((size_t)hh * H + ww) * D];
+                auto cosab = [](const std::vector<float>& a, const std::vector<float>& b) {
+                    double d = 0, na = 0, nb = 0; size_t n = std::min(a.size(), b.size());
+                    for (size_t i = 0; i < n; ++i) { d += (double)a[i] * b[i]; na += (double)a[i] * a[i]; nb += (double)b[i] * b[i]; }
+                    return (na > 0 && nb > 0) ? d / (sqrt(na) * sqrt(nb)) : 0.0;
+                };
+                std::vector<float> mf((size_t)MD * N_perc), mp2((size_t)MD * N_perc);
+                edgetam_coreml_memencode(s_pe, pc.data(), raw.data(), mf.data(), mp2.data());  // current transpose (c,h,w)
+                // pix_feat with H/W swapped (write to (c,w,h)) — tests a spatial transpose bug
+                std::vector<float> pcS((size_t)D * H * H);
+                for (int hh = 0; hh < H; ++hh)
+                    for (int ww = 0; ww < H; ++ww)
+                        for (int cc = 0; cc < D; ++cc)
+                            pcS[(size_t)cc * H * H + (size_t)ww * H + hh] = n2[(size_t)cc + ((size_t)hh * H + ww) * D];
+                std::vector<float> mfS((size_t)MD * N_perc), mpS((size_t)MD * N_perc);
+                edgetam_coreml_memencode(s_pe, pcS.data(), raw.data(), mfS.data(), mpS.data());
+                fprintf(stderr, "MEMENC_PARITY f%d: feats cos transpose=%.4f swapHW=%.4f  pos cos=%.4f\n",
+                        frame_idx, cosab(perc_latents, mf), cosab(perc_latents, mfS), cosab(perc_pos, mp2));
+            }
+        }
+#endif
+        // Store perceiver output: [MD=64, N_perc] (N_1d + N_2d latents)
         auto* st = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, MD, N_perc);
         auto* sb = ggml_backend_alloc_buffer(model.backend, MD * N_perc * sizeof(float));
         struct ggml_tallocr ta_perc = ggml_tallocr_new(sb);
