@@ -26,6 +26,11 @@ target_compile_definitions(sam3_edgetam_bench PRIVATE SAM3_TIMING)
 if(SAM3_COREML)
     add_executable(sam3_coreml_pipeline sam3_coreml_pipeline.cpp)
     target_link_libraries(sam3_coreml_pipeline PRIVATE sam3)
+
+    # RFD 0011 U8: threaded (encoder-ahead) real-bank tracker bench.
+    add_executable(sam3_coreml_tracker_threaded sam3_coreml_tracker_threaded.cpp)
+    target_link_libraries(sam3_coreml_tracker_threaded PRIVATE sam3)
+    target_compile_definitions(sam3_coreml_tracker_threaded PRIVATE SAM3_TIMING)
 endif()
 
 # SDL2 + ImGui are optional — build only if SDL2 is found.

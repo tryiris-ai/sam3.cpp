@@ -4974,6 +4974,27 @@ static void edgetam_build_repvit_graph(struct ggml_context* ctx,
 
 #ifdef SAM3_COREML
 #include "edgetam_coreml.h"
+
+// RFD 0011 U8 (threaded encoder-ahead): the producer thread runs preprocess +
+// CoreML encode for frame N+1 into s_prefetch_neck while the main thread runs the
+// consumer (assembly+memattn+decode+memencode+bank) for frame N. When a prefetched
+// neck is ready, the main thread's encode step copies it (skipping BOTH preprocess
+// and the CoreML encode), so the ~17 ms encoder leg overlaps the ~52 ms consumer.
+// SPSC: the bench serializes set→consume per frame, so no lock is needed here.
+static std::vector<float> s_prefetch_neck[3];
+static bool s_prefetch_ready = false;
+void sam3_coreml_set_prefetched_neck(const float* n0, const float* n1, const float* n2) {
+    const int Wd[3] = {256, 128, 64}, D = 256;
+    const float* src[3] = {n0, n1, n2};
+    for (int i = 0; i < 3; ++i)
+        s_prefetch_neck[i].assign(src[i], src[i] + (size_t)D * Wd[i] * Wd[i]);
+    s_prefetch_ready = true;
+}
+// Exposed for the producer thread (preprocess off the main thread).
+std::vector<float> sam3_coreml_preprocess_image(const sam3_image& image, int img_size) {
+    return sam2_preprocess_image(image, img_size);
+}
+
 // RFD 0011 (CoreML/ANE hybrid): run the EdgeTAM encoder on CoreML/ANE (~12 ms)
 // instead of the ggml/Metal RepViT (~122 ms) and load the ggml-matching 256-ch
 // neck features into state.neck_trk. The CoreML model exports neck(trunk(x))[0:3]
@@ -4984,7 +5005,7 @@ static bool edgetam_encode_image_coreml(sam3_state& state, const sam3_model& mod
                                         const sam3_image& image,
                                         const std::vector<float>& img_norm) {
     static edgetam_coreml_handle s_enc = nullptr;
-    if (!s_enc) {
+    if (!s_prefetch_ready && !s_enc) {  // prefetch path needs no local encoder handle
         const char* mp = getenv("SAM3_COREML_MODEL");
         if (!mp) { fprintf(stderr, "%s: SAM3_COREML_ENCODER set but SAM3_COREML_MODEL unset\n", __func__); return false; }
         s_enc = edgetam_coreml_create(mp, /*compute_units=ANE*/ 1);
@@ -5003,7 +5024,10 @@ static bool edgetam_encode_image_coreml(sam3_state& state, const sam3_model& mod
     static std::vector<float> nbuf[3];
     for (int i = 0; i < 3; ++i) nbuf[i].resize((size_t)D * Wd[i] * Hd[i]);
 
-    {
+    if (s_prefetch_ready) {  // threaded: producer already encoded this frame off-thread
+        for (int i = 0; i < 3; ++i) nbuf[i].swap(s_prefetch_neck[i]);
+        s_prefetch_ready = false;
+    } else {
         SAM3_TIME_SCOPE(image_encoder_compute_ms);   // the ANE inference itself
         if (!edgetam_coreml_encode(s_enc, img_norm.data(),
                                    nbuf[0].data(), nbuf[1].data(), nbuf[2].data()))
@@ -5066,6 +5090,21 @@ static bool edgetam_encode_image(sam3_state& state,
     state.orig_width = image.width;
     state.orig_height = image.height;
 
+#ifdef SAM3_COREML
+    // RFD 0011 (CoreML/ANE hybrid): when enabled, run the encoder on CoreML/ANE
+    // and skip the ggml RepViT+FPN graph entirely. Threaded (encoder-ahead): when a
+    // prefetched neck is ready the producer already did preprocess + encode off-thread,
+    // so skip preprocess here too — the helper consumes the prefetched neck.
+    if (getenv("SAM3_COREML_ENCODER")) {
+        std::vector<float> cml_img;
+        if (!s_prefetch_ready) {
+            SAM3_TIME_SCOPE(preprocess_ms);
+            cml_img = sam2_preprocess_image(image, img_size);  // NCHW [1,3,1024,1024]
+        }
+        return edgetam_encode_image_coreml(state, model, image, cml_img);
+    }
+#endif
+
     // ── Preprocess (same ImageNet normalization as SAM2) ─────────────────
     // RFD 0011 U0: preprocess timed separately from the graph build/alloc/compute.
     std::vector<float> img_data;
@@ -5073,16 +5112,6 @@ static bool edgetam_encode_image(sam3_state& state,
         SAM3_TIME_SCOPE(preprocess_ms);
         img_data = sam2_preprocess_image(image, img_size);
     }
-
-#ifdef SAM3_COREML
-    // RFD 0011 (CoreML/ANE hybrid): when enabled, run the encoder on CoreML/ANE
-    // and skip the ggml RepViT+FPN graph entirely. img_data is already NCHW
-    // [1,3,1024,1024] (ggml inp ne=[W,H,C] == numpy NCHW), so it hands straight
-    // to CoreML; only the 256-ch neck outputs need a layout permute (in helper).
-    if (getenv("SAM3_COREML_ENCODER")) {
-        return edgetam_encode_image_coreml(state, model, image, img_data);
-    }
-#endif
 
     // ── Build graph ──────────────────────────────────────────────────────
     // RFD 0011 U0: graph CONSTRUCTION region (image_encoder_build_ms). U1 will

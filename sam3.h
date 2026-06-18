@@ -359,6 +359,18 @@ bool            sam3_save_mask(const sam3_mask & mask, const std::string & path)
 sam3_image      sam3_decode_video_frame(const std::string & video_path, int frame_index);
 sam3_video_info sam3_get_video_info(const std::string & video_path);
 
+/*
+** ── RFD 0011 U8: threaded encoder-ahead (CoreML) ─────────────────────────
+** The producer thread preprocesses + CoreML-encodes frame N+1 off the main
+** thread, then hands the 3 neck levels here; the next sam3_propagate_frame's
+** encode step consumes them (skipping preprocess + encode) so the encoder leg
+** overlaps the consumer. Built only with SAM3_COREML; no-ops otherwise.
+*/
+void              sam3_coreml_set_prefetched_neck(const float* neck0,
+                                                  const float* neck1,
+                                                  const float* neck2);
+std::vector<float> sam3_coreml_preprocess_image(const sam3_image& image, int img_size);
+
 /*****************************************************************************
 ** Test and Debug API
 **
