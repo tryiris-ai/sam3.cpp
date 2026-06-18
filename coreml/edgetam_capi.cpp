@@ -46,6 +46,14 @@ extern "C" edgetam_tracker_t edgetam_capi_create(const char* models_dir,
             setenv("SAM3_COREML_MEMATTN_MODEL", (d + "/edgetam_memory_attention.mlpackage").c_str(), 1);
             setenv("SAM3_COREML_DECODER", "1", 1);
             setenv("SAM3_COREML_DECODER_MODEL", (d + "/edgetam_mask_decoder_nhwc.mlpackage").c_str(), 1);
+            // Memory-encode on ANE + a fixed-size (padded) memory bank. The CoreML
+            // mem-attention model has a static 3648-token input (7*512 + 16*4); PAD_BANK
+            // pads the live bank to that shape so MEMATTN actually runs on the ANE/GPU
+            // instead of silently falling back to the ~184ms ggml path. Without these two
+            // the tracker is correct but ~8x slower (measured 570ms vs 69ms/frame).
+            setenv("SAM3_COREML_MEMENC", "1", 1);
+            setenv("SAM3_COREML_MEMENC_MODEL", (d + "/edgetam_memory_encode.mlpackage").c_str(), 1);
+            setenv("SAM3_COREML_PAD_BANK", "1", 1);
         }
         auto t = std::make_unique<EtTracker>();
         sam3_params p;
