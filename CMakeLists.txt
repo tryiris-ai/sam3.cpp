@@ -57,6 +57,8 @@ if(APPLE)
         set_source_files_properties(coreml/edgetam_coreml.mm PROPERTIES
             LANGUAGE CXX
             COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+        # RFD 0011 U8: extern "C" tracker C-ABI for cgo into iris/platform.
+        target_sources(sam3 PRIVATE coreml/edgetam_capi.cpp)
         target_include_directories(sam3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/coreml)
         target_compile_definitions(sam3 PUBLIC SAM3_COREML)
         target_link_libraries(sam3 PUBLIC "-framework CoreML" "-framework Foundation")
