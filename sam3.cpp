@@ -11669,36 +11669,11 @@ static sam3_prop_output sam3_propagate_single(
     sam3_ensure_tracker_pe_caches(tracker, hp, H);
     const int half_d = D / 2;  // 128
     const auto& rope_q_reord = tracker.cached_axial_cis_reord;
-    // For cross-attn K: build rope_k_data for all M_spatial tokens
+    // RFD 0011 U8 perf: rope_k_data feeds ONLY the ggml mem-attn fallback graph.
+    // The CoreML mem-attn path (below) uses cached_sinpe_256, never rope_k_data,
+    // so building it here is ~2 ms/frame of pure waste on the hot path. Moved to
+    // just before the ggml graph build, so it runs only when CoreML did NOT.
     std::vector<float> rope_k_data;
-    if (pd.M_spatial > 0) {
-        rope_k_data.resize(2 * half_d * pd.M_spatial);
-        if (use_perceiver) {
-            // EdgeTAM perceiver: each frame has N_per_slot=512 tokens.
-            // First 256 (1D latents): identity RoPE (cos=1, sin=0).
-            // Last 256 (2D latents): 16x16 RoPE from cached_axial_cis_k16_reord.
-            const int N_1d = hp.perceiver_n_latents_1d;   // 256
-            const int N_2d = hp.perceiver_n_latents_2d;   // 256
-            const auto& rope_k16 = tracker.cached_axial_cis_k16_reord;  // [2, 128, 256]
-            for (int s = 0; s < n_sel; ++s) {
-                float* dst = rope_k_data.data() + s * D * N_per_slot;
-                // 1D tokens: identity RoPE (cos=1, sin=0) in [2, half_d, N_1d] layout
-                // Layout: for token n, dim i: cos at [0 + i*2 + n*D], sin at [1 + i*2 + n*D]
-                for (int n = 0; n < N_1d; ++n)
-                    for (int i = 0; i < half_d; ++i) {
-                        dst[0 + i * 2 + n * D] = 1.0f;  // cos = 1
-                        dst[1 + i * 2 + n * D] = 0.0f;  // sin = 0
-                    }
-                // 2D tokens: copy 16x16 RoPE
-                float* dst_2d = dst + D * N_1d;
-                memcpy(dst_2d, rope_k16.data(), D * N_2d * sizeof(float));
-            }
-        } else {
-            // Standard: repeat HxH axial CIS for each memory frame
-            for (int s = 0; s < pd.M_spatial / N; ++s)
-                memcpy(rope_k_data.data() + s * D * N, rope_q_reord.data(), D * N * sizeof(float));
-        }
-    }
 
     // RFD 0011 (CoreML/ANE hybrid): run the memory attention on CoreML-GPU
     // (~18 ms vs ggml ~185 ms) at the fixed steady-state capacity (7 memory
@@ -11782,6 +11757,36 @@ static sam3_prop_output sam3_propagate_single(
         }
     }
 #endif
+
+    // RFD 0011 U8 perf: build rope_k_data HERE — only reached when the CoreML
+    // mem-attn/decoder path above did NOT return (fallback to the ggml graph).
+    if (pd.M_spatial > 0) {
+        rope_k_data.resize(2 * half_d * pd.M_spatial);
+        if (use_perceiver) {
+            // EdgeTAM perceiver: each frame has N_per_slot=512 tokens.
+            // First 256 (1D latents): identity RoPE (cos=1, sin=0).
+            // Last 256 (2D latents): 16x16 RoPE from cached_axial_cis_k16_reord.
+            const int N_1d = hp.perceiver_n_latents_1d;   // 256
+            const int N_2d = hp.perceiver_n_latents_2d;   // 256
+            const auto& rope_k16 = tracker.cached_axial_cis_k16_reord;  // [2, 128, 256]
+            for (int s = 0; s < n_sel; ++s) {
+                float* dst = rope_k_data.data() + s * D * N_per_slot;
+                // 1D tokens: identity RoPE (cos=1, sin=0) in [2, half_d, N_1d] layout
+                for (int n = 0; n < N_1d; ++n)
+                    for (int i = 0; i < half_d; ++i) {
+                        dst[0 + i * 2 + n * D] = 1.0f;  // cos = 1
+                        dst[1 + i * 2 + n * D] = 0.0f;  // sin = 0
+                    }
+                // 2D tokens: copy 16x16 RoPE
+                float* dst_2d = dst + D * N_1d;
+                memcpy(dst_2d, rope_k16.data(), D * N_2d * sizeof(float));
+            }
+        } else {
+            // Standard: repeat HxH axial CIS for each memory frame
+            for (int s = 0; s < pd.M_spatial / N; ++s)
+                memcpy(rope_k_data.data() + s * D * N, rope_q_reord.data(), D * N * sizeof(float));
+        }
+    }
 
     // ── Build graph ─────────────────────────────────────────────────────
     // RFD 0011 U0: mem-attn + SAM mask decoder graph CONSTRUCTION region
