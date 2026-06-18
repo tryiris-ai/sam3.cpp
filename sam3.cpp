@@ -11611,6 +11611,29 @@ static sam3_prop_output sam3_propagate_single(
         if (ptr_tpos[p] < 1) ptr_tpos[p] = 1;  // minimum distance of 1
     }
 
+#ifdef SAM3_COREML
+    // RFD 0011 U8 Wave 1: force full mem-attn capacity (num_maskmem spatial slots +
+    // max_obj_ptrs pointer slots = 3648 tokens) from frame 1, so the CoreML mem-attn
+    // engages EVERY frame instead of falling back to ggml on early (not-yet-full)
+    // frames. Required to test a consistent all-CoreML pipeline (CoreML memencode
+    // slots must not be fed to the ggml mem-attn). Pad spatial slots by repeating the
+    // most-recent slot; pad pointers with no_obj_ptr at a far temporal distance.
+    if (getenv("SAM3_COREML_PAD_BANK") && use_perceiver && !slot_feats.empty()) {
+        while ((int)slot_feats.size() < hp.num_maskmem) {
+            slot_feats.push_back(slot_feats.back());
+            slot_pes.push_back(slot_pes.back());
+            spatial_tpos.push_back(spatial_tpos.back());
+        }
+        if (model.no_obj_ptr) {
+            std::vector<float> nop(D);
+            sam3_read_f32(model.no_obj_ptr, nop.data(), D);
+            while ((int)obj_ptrs.size() < hp.max_obj_ptrs) {
+                obj_ptrs.push_back(nop);
+                ptr_tpos.push_back(hp.max_obj_ptrs);
+            }
+        }
+    }
+#endif
     auto pd = sam3_build_prompt_and_pos(model, slot_feats, slot_pes, spatial_tpos, obj_ptrs, ptr_tpos, H);
 
     // ── RoPE frequencies (cached) ──────────────────────────────────────
