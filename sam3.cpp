@@ -12106,6 +12106,73 @@ static bool sam3_encode_memory(
 
     // Mask preprocessing: mask_logits → HIGH_RES → sigmoid → scale/bias → INTERPOL
     auto m_hires = sam3_bilinear_interpolate(mask_logits, mask_w, mask_h, HIGH_RES, HIGH_RES);
+#ifdef SAM3_COREML
+    // RFD 0011 U8 Wave 1: CoreML memory-encode (memory_encoder + spatial_perceiver,
+    // ~6ms ANE vs ~24ms ggml). ⚠️ WIP — SPEED VERIFIED (7.8→10.86 fps, mem_encoder
+    // 24→0ms) but ACCURACY BROKEN (goldeneval dt0004 0.000, 107 lost): the slot the
+    // model produces here mismatches the ggml perceiver slot — a pix_feat (HWC→BCHW)
+    // or mask-input layout-parity bug in the seed/conditioning slot. FIX: dump this
+    // path's mfeat/mpos vs edgetam_perceiver_forward's perc_latents/perc_pos for one
+    // frame and cosine-compare to find the wrong axis. Gated OFF by default (env
+    // SAM3_COREML_MEMENC), so the ggml memencode below remains the correct path.
+    // The exported model applies the mask sigmoid internally
+    // (convert_memenc_coreml.py: skip_mask_sigmoid=False), so it takes RAW logits at
+    // HIGH_RES — i.e. m_hires BEFORE the sigmoid below. pix_feat is neck2 transposed
+    // from ggml HWC (channel-fastest) to BCHW. Output is the perceiver slot
+    // (== the ggml path's perc_latents/perc_pos), stored identically. Returns early,
+    // skipping the per-frame ggml memencode graph entirely.
+    if (getenv("SAM3_COREML_MEMENC") && hp.has_perceiver) {
+        static edgetam_coreml_handle s_memenc = nullptr;
+        static bool s_memenc_tried = false;
+        if (!s_memenc && !s_memenc_tried) {
+            s_memenc_tried = true;
+            const char* mp = getenv("SAM3_COREML_MEMENC_MODEL");
+            if (mp) {
+                s_memenc = edgetam_coreml_create(mp, /*CPU_AND_NE*/ 1);
+                if (s_memenc) fprintf(stderr, "%s: CoreML memenc loaded (ANE): %s\n", __func__, mp);
+            }
+        }
+        if (s_memenc) {
+            std::vector<float> n2((size_t)D * H * H), pix_chw((size_t)D * H * H);
+            ggml_backend_tensor_get(state.neck_trk[2], n2.data(), 0, (size_t)D * H * H * sizeof(float));
+            for (int h = 0; h < H; ++h)
+                for (int w = 0; w < H; ++w)
+                    for (int c = 0; c < D; ++c)
+                        pix_chw[(size_t)c * H * H + (size_t)h * H + w] = n2[(size_t)c + ((size_t)h * H + w) * D];
+            const int N_perc = hp.perceiver_n_latents_1d + hp.perceiver_n_latents_2d;  // 512
+            std::vector<float> mfeat((size_t)MD * N_perc), mpos((size_t)MD * N_perc);
+            if (edgetam_coreml_memencode(s_memenc, pix_chw.data(), m_hires.data(), mfeat.data(), mpos.data())) {
+                if (!tracker.ctx) {
+                    struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
+                    tracker.ctx = ggml_init(tp);
+                }
+                auto store_slot = [&](const std::vector<float>& src) {
+                    auto* t = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, MD, N_perc);
+                    auto* b = ggml_backend_alloc_buffer(model.backend, (size_t)MD * N_perc * sizeof(float));
+                    struct ggml_tallocr a = ggml_tallocr_new(b);
+                    ggml_tallocr_alloc(&a, t);
+                    tracker.owned_buffers.push_back(b);
+                    ggml_backend_tensor_set(t, src.data(), 0, (size_t)MD * N_perc * sizeof(float));
+                    return t;
+                };
+                sam3_memory_slot slot;
+                slot.spatial_feats = store_slot(mfeat);
+                slot.spatial_pe = store_slot(mpos);
+                slot.frame_index = frame_idx;
+                slot.is_cond_frame = is_cond;
+                auto& bk = tracker.mem_banks[inst_id];
+                bk.push_back(slot);
+                while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
+                    bool removed = false;
+                    for (auto it = bk.begin(); it != bk.end(); ++it)
+                        if (!it->is_cond_frame) { bk.erase(it); removed = true; break; }
+                    if (!removed) bk.erase(bk.begin() + 1);
+                }
+                return true;
+            }
+        }
+    }
+#endif
     const float sig_scale = hp.sigmoid_scale(), sig_bias = hp.sigmoid_bias();
     for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * sig_scale + sig_bias; }
     auto m_interp = sam3_bilinear_interpolate(m_hires.data(), HIGH_RES, HIGH_RES, INTERPOL, INTERPOL);
