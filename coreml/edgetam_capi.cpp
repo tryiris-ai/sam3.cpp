@@ -4,6 +4,7 @@
 // exceptions are caught at the boundary (cgo cannot unwind through Go).
 #include "edgetam_capi.h"
 #include "../sam3.h"
+#include "edgetam_coreml.h"   // producer encoder handle (edgetam_coreml_create/encode/destroy)
 
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,16 @@ struct EtTracker {
     std::shared_ptr<sam3_model> model;
     sam3_state_ptr              state;
     sam3_tracker_ptr            tracker;
+
+    // RFD 0011 U8 Wave 5 (encoder-ahead threading): a producer encoder handle
+    // (its OWN MLModel, per-thread ownership) + a fixed neck pool. Go owns slot
+    // free/ready coordination via channels, so NO lock here — each slot is written
+    // once by encode_slot (producer thread) then read once by track_slot (consumer
+    // thread). track_slot is the ONLY caller of sam3_coreml_set_prefetched_neck
+    // (global, consumer-thread-only). prod_enc is non-null only when CoreML is on.
+    edgetam_coreml_handle prod_enc = nullptr;
+    static const int      POOL = 3;
+    std::vector<float>    neck[POOL][3];   // n0 256*256*256, n1 128*128*256, n2 64*64*256
 };
 
 // Wrap a caller RGB24 buffer as a sam3_image (copies into the owned vector — the
@@ -64,6 +75,15 @@ extern "C" edgetam_tracker_t edgetam_capi_create(const char* models_dir,
         t->state = sam3_create_state(*t->model, p);
         sam3_visual_track_params vp;  // defaults match sam3_edgetam_bench
         t->tracker = sam3_create_visual_tracker(*t->model, vp);
+        // Wave 5: producer encoder handle + neck pool (only when CoreML is on).
+        if (models_dir && *models_dir) {
+            std::string d = models_dir;
+            t->prod_enc = edgetam_coreml_create((d + "/edgetam_encoder_neck_nhwc.mlpackage").c_str(), /*ANE*/ 1);
+            const int Wd[3] = {256, 128, 64};
+            for (int s = 0; s < EtTracker::POOL; ++s)
+                for (int i = 0; i < 3; ++i)
+                    t->neck[s][i].assign((size_t)256 * Wd[i] * Wd[i], 0.f);
+        }
         return t.release();
     } catch (...) {
         return nullptr;
@@ -117,7 +137,66 @@ extern "C" void edgetam_capi_reset(edgetam_tracker_t h) {
 }
 
 extern "C" void edgetam_capi_destroy(edgetam_tracker_t h) {
-    delete static_cast<EtTracker*>(h);
+    auto* t = static_cast<EtTracker*>(h);
+    if (t && t->prod_enc) edgetam_coreml_destroy(t->prod_enc);
+    delete t;
+}
+
+// ── RFD 0011 U8 Wave 5: encoder-ahead split ──────────────────────────────────
+// Go drives the pipeline: a producer goroutine pops a free slot, calls
+// encode_slot; a consumer goroutine calls track_slot then recycles the slot. The
+// two run on different OS threads (per-thread MLModel ownership): encode_slot uses
+// the producer encoder handle; track_slot consumes the prefetched neck and never
+// encodes. Go's channels serialize each slot (write-then-read), so no lock here.
+
+extern "C" int edgetam_capi_pool_size(edgetam_tracker_t h) {
+    auto* t = static_cast<EtTracker*>(h);
+    return (t && t->prod_enc) ? EtTracker::POOL : 0;   // 0 => threading unavailable
+}
+
+extern "C" int edgetam_capi_encode_slot(edgetam_tracker_t h, int slot,
+                                        const uint8_t* rgb, int w, int hgt) {
+    auto* t = static_cast<EtTracker*>(h);
+    if (!t || !t->prod_enc || !rgb || slot < 0 || slot >= EtTracker::POOL) return 0;
+    try {
+        sam3_image img = make_image(rgb, w, hgt);
+        std::vector<float> norm = sam3_coreml_preprocess_image(img, 1024);
+        return edgetam_coreml_encode(t->prod_enc, norm.data(),
+                                     t->neck[slot][0].data(),
+                                     t->neck[slot][1].data(),
+                                     t->neck[slot][2].data()) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" et_result edgetam_capi_track_slot(edgetam_tracker_t h, int slot,
+                                             const uint8_t* rgb, int w, int hgt) {
+    et_result r;
+    std::memset(&r, 0, sizeof(r));
+    auto* t = static_cast<EtTracker*>(h);
+    if (!t || !rgb || slot < 0 || slot >= EtTracker::POOL) return r;
+    try {
+        // Consumer thread only: hand the producer-encoded neck to the library so
+        // sam3_propagate_frame's encode step is skipped (no ggml/CoreML encode here).
+        sam3_coreml_set_prefetched_neck(t->neck[slot][0].data(),
+                                        t->neck[slot][1].data(),
+                                        t->neck[slot][2].data());
+        sam3_image img = make_image(rgb, w, hgt);
+        sam3_result res = sam3_propagate_frame(*t->tracker, *t->state, *t->model, img);
+        if (res.detections.empty()) return r;
+        const sam3_detection& d = res.detections[0];
+        const float W = (float)w, H = (float)hgt;
+        r.box.x0 = d.box.x0 / W; r.box.y0 = d.box.y0 / H;
+        r.box.x1 = d.box.x1 / W; r.box.y1 = d.box.y1 / H;
+        r.valid     = 1;
+        r.obj_score = d.score;
+        r.mask_iou  = d.iou_score;
+        r.state     = (int)d.state;
+        return r;
+    } catch (...) {
+        return r;
+    }
 }
 
 extern "C" const char* edgetam_capi_version(void) {
