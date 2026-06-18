@@ -31,6 +31,10 @@ if(SAM3_COREML)
     add_executable(sam3_coreml_tracker_threaded sam3_coreml_tracker_threaded.cpp)
     target_link_libraries(sam3_coreml_tracker_threaded PRIVATE sam3)
     target_compile_definitions(sam3_coreml_tracker_threaded PRIVATE SAM3_TIMING)
+
+    # RFD 0011 U8 Wave 5: encoder-ahead via the cgo C-ABI (capi encode_slot/track_slot).
+    add_executable(sam3_coreml_capi_threaded sam3_coreml_capi_threaded.cpp)
+    target_link_libraries(sam3_coreml_capi_threaded PRIVATE sam3)
 endif()
 
 # SDL2 + ImGui are optional — build only if SDL2 is found.
