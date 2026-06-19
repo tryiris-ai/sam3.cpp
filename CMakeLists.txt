@@ -16,6 +16,16 @@ if(APPLE AND SAM3_METAL)
     set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
 endif()
 
+# RFD 0011 (Windows/Linux cross-vendor GPU): ggml-Vulkan covers AMD/NVIDIA/Intel
+# from one build. The Mac path uses Metal+CoreML; this is the non-Apple GPU path.
+# The same cgo C-ABI (coreml/edgetam_capi.cpp) is reused below — its CoreML stage
+# calls are #ifdef SAM3_COREML-guarded, so a Vulkan build runs the pure-ggml path
+# (which lands on the Vulkan device). Requires the Vulkan SDK (glslc) at build.
+option(SAM3_VULKAN "Enable the ggml-Vulkan cross-vendor GPU backend (non-Apple)" OFF)
+if(NOT APPLE AND SAM3_VULKAN)
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory(ggml)
 
 # sam3 static library
@@ -63,6 +73,15 @@ if(APPLE)
         target_compile_definitions(sam3 PUBLIC SAM3_COREML)
         target_link_libraries(sam3 PUBLIC "-framework CoreML" "-framework Foundation")
     endif()
+endif()
+
+# RFD 0011 (Windows/Vulkan): reuse the cgo tracker C-ABI on the non-Apple Vulkan
+# path WITHOUT the CoreML bridge. edgetam_capi.cpp's CoreML stage calls + producer-
+# encoder pool are #ifdef SAM3_COREML-guarded, so here the tracker runs the pure-
+# ggml path on the Vulkan device. SAM3_COREML is NOT defined, no .mm, no frameworks.
+if(NOT APPLE AND SAM3_VULKAN)
+    target_sources(sam3 PRIVATE coreml/edgetam_capi.cpp)
+    target_include_directories(sam3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/coreml)
 endif()
 
 # Examples (only when top-level)

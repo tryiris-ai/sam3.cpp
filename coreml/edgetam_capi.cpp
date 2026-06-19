@@ -45,10 +45,14 @@ extern "C" edgetam_tracker_t edgetam_capi_create(const char* models_dir,
                                                  const char* ggml_model,
                                                  int /*use_samurai*/, int /*use_lifecycle*/) {
     try {
+#ifdef SAM3_COREML
         // Enable the CoreML stages (encoder ANE + mem-attn GPU + decoder ANE) by
         // pointing the library's existing runtime gates at the .mlpackage dir.
         // The library's full-CoreML propagation path then runs with zero ggml
         // graph work per frame; ggml remains the seed + early-frame fallback.
+        // On a non-CoreML build (e.g. Windows/Vulkan, SAM3_VULKAN) this block is
+        // absent → models_dir is ignored and the tracker runs the pure-ggml path,
+        // which lands on whatever ggml GPU backend is compiled (Vulkan).
         if (models_dir && *models_dir) {
             std::string d = models_dir;
             setenv("SAM3_COREML_ENCODER", "1", 1);
@@ -66,6 +70,9 @@ extern "C" edgetam_tracker_t edgetam_capi_create(const char* models_dir,
             setenv("SAM3_COREML_MEMENC_MODEL", (d + "/edgetam_memory_encode.mlpackage").c_str(), 1);
             setenv("SAM3_COREML_PAD_BANK", "1", 1);
         }
+#else
+        (void)models_dir;  // Vulkan/CPU build: pure-ggml path, no CoreML stage gates
+#endif
         auto t = std::make_unique<EtTracker>();
         sam3_params p;
         p.model_path = ggml_model ? ggml_model : "";
@@ -75,7 +82,10 @@ extern "C" edgetam_tracker_t edgetam_capi_create(const char* models_dir,
         t->state = sam3_create_state(*t->model, p);
         sam3_visual_track_params vp;  // defaults match sam3_edgetam_bench
         t->tracker = sam3_create_visual_tracker(*t->model, vp);
-        // Wave 5: producer encoder handle + neck pool (only when CoreML is on).
+#ifdef SAM3_COREML
+        // Wave 5: producer encoder handle + neck pool (CoreML encoder-ahead threading).
+        // Absent on non-CoreML builds → prod_enc stays null → pool_size()==0 →
+        // the cgo session uses the synchronous (single-thread) Track path.
         if (models_dir && *models_dir) {
             std::string d = models_dir;
             t->prod_enc = edgetam_coreml_create((d + "/edgetam_encoder_neck_nhwc.mlpackage").c_str(), /*ANE*/ 1);
@@ -84,6 +94,7 @@ extern "C" edgetam_tracker_t edgetam_capi_create(const char* models_dir,
                 for (int i = 0; i < 3; ++i)
                     t->neck[s][i].assign((size_t)256 * Wd[i] * Wd[i], 0.f);
         }
+#endif
         return t.release();
     } catch (...) {
         return nullptr;
@@ -138,7 +149,9 @@ extern "C" void edgetam_capi_reset(edgetam_tracker_t h) {
 
 extern "C" void edgetam_capi_destroy(edgetam_tracker_t h) {
     auto* t = static_cast<EtTracker*>(h);
+#ifdef SAM3_COREML
     if (t && t->prod_enc) edgetam_coreml_destroy(t->prod_enc);
+#endif
     delete t;
 }
 
@@ -158,6 +171,7 @@ extern "C" int edgetam_capi_encode_slot(edgetam_tracker_t h, int slot,
                                         const uint8_t* rgb, int w, int hgt) {
     auto* t = static_cast<EtTracker*>(h);
     if (!t || !t->prod_enc || !rgb || slot < 0 || slot >= EtTracker::POOL) return 0;
+#ifdef SAM3_COREML
     try {
         sam3_image img = make_image(rgb, w, hgt);
         std::vector<float> norm = sam3_coreml_preprocess_image(img, 1024);
@@ -168,6 +182,10 @@ extern "C" int edgetam_capi_encode_slot(edgetam_tracker_t h, int slot,
     } catch (...) {
         return 0;
     }
+#else
+    (void)rgb; (void)w; (void)hgt;  // encoder-ahead threading is CoreML-only
+    return 0;
+#endif
 }
 
 extern "C" et_result edgetam_capi_track_slot(edgetam_tracker_t h, int slot,
@@ -177,11 +195,13 @@ extern "C" et_result edgetam_capi_track_slot(edgetam_tracker_t h, int slot,
     auto* t = static_cast<EtTracker*>(h);
     if (!t || !rgb || slot < 0 || slot >= EtTracker::POOL) return r;
     try {
+#ifdef SAM3_COREML
         // Consumer thread only: hand the producer-encoded neck to the library so
         // sam3_propagate_frame's encode step is skipped (no ggml/CoreML encode here).
         sam3_coreml_set_prefetched_neck(t->neck[slot][0].data(),
                                         t->neck[slot][1].data(),
                                         t->neck[slot][2].data());
+#endif
         sam3_image img = make_image(rgb, w, hgt);
         sam3_result res = sam3_propagate_frame(*t->tracker, *t->state, *t->model, img);
         if (res.detections.empty()) return r;
