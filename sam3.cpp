@@ -4983,6 +4983,19 @@ static void edgetam_build_repvit_graph(struct ggml_context* ctx,
 // SPSC: the bench serializes set→consume per frame, so no lock is needed here.
 static std::vector<float> s_prefetch_neck[3];
 static bool s_prefetch_ready = false;
+
+// RFD 0011 U8 — per-chip CoreML compute-unit profile (0=ALL 1=ANE 2=GPU 3=CPU).
+// M4 Pro sweep (sam3_coreml_pipeline, isolated 20-rep median): encoder ANE 11ms
+// (GPU 14, CPU 38), mem-attn GPU 17ms (ANE 26, CPU 24), decoder ANE 7.8ms (GPU 8.2),
+// memenc ANE 5.0 / GPU 3.9. Defaults = the validated M4 optimum (enc ANE, mem-attn
+// GPU, decoder ANE, memenc ANE — memenc's isolated GPU edge washes out in thermal
+// noise end-to-end). NOT inverted vs M1 like the ORT/EfficientTAM stack. Override
+// per chip via env (e.g. SAM3_COREML_MA_UNIT=1) if M1/M2/M3 profiles differ.
+static int sam3_coreml_unit(const char* env, int def) {
+    const char* v = getenv(env);
+    return (v && *v) ? atoi(v) : def;
+}
+
 void sam3_coreml_set_prefetched_neck(const float* n0, const float* n1, const float* n2) {
     const int Wd[3] = {256, 128, 64}, D = 256;
     const float* src[3] = {n0, n1, n2};
@@ -5008,7 +5021,7 @@ static bool edgetam_encode_image_coreml(sam3_state& state, const sam3_model& mod
     if (!s_prefetch_ready && !s_enc) {  // prefetch path needs no local encoder handle
         const char* mp = getenv("SAM3_COREML_MODEL");
         if (!mp) { fprintf(stderr, "%s: SAM3_COREML_ENCODER set but SAM3_COREML_MODEL unset\n", __func__); return false; }
-        s_enc = edgetam_coreml_create(mp, /*compute_units=ANE*/ 1);
+        s_enc = edgetam_coreml_create(mp, sam3_coreml_unit("SAM3_COREML_ENC_UNIT", /*ANE*/ 1));
         if (!s_enc) { fprintf(stderr, "%s: CoreML encoder load failed\n", __func__); return false; }
         fprintf(stderr, "%s: CoreML EdgeTAM encoder loaded (ANE): %s\n", __func__, mp);
     }
@@ -11694,7 +11707,7 @@ static sam3_prop_output sam3_propagate_single(
             s_memattn_tried = true;
             const char* mp = getenv("SAM3_COREML_MEMATTN_MODEL");
             if (mp) {
-                s_memattn = edgetam_coreml_create(mp, /*CPU_AND_GPU*/ 2);
+                s_memattn = edgetam_coreml_create(mp, sam3_coreml_unit("SAM3_COREML_MA_UNIT", /*GPU*/ 2));
                 if (s_memattn) fprintf(stderr, "%s: CoreML mem-attn loaded (GPU): %s\n", __func__, mp);
             }
         }
@@ -11722,7 +11735,7 @@ static sam3_prop_output sam3_propagate_single(
             s_decoder_tried = true;
             const char* mp = getenv("SAM3_COREML_DECODER_MODEL");
             if (mp) {
-                s_decoder = edgetam_coreml_create(mp, /*CPU_AND_NE*/ 1);
+                s_decoder = edgetam_coreml_create(mp, sam3_coreml_unit("SAM3_COREML_DEC_UNIT", /*ANE*/ 1));
                 if (s_decoder) fprintf(stderr, "%s: CoreML decoder loaded (ANE): %s\n", __func__, mp);
             }
         }
@@ -12191,7 +12204,11 @@ static bool sam3_encode_memory(
             s_memenc_tried = true;
             const char* mp = getenv("SAM3_COREML_MEMENC_MODEL");
             if (mp) {
-                s_memenc = edgetam_coreml_create(mp, /*CPU_AND_NE*/ 1);
+                // memenc GPU is ~1.1ms faster in isolation (M4 bench: 3.9 vs ANE 5.0) but the
+                // win is WITHIN thermal run-to-run noise end-to-end (A/B inconclusive) and
+                // accuracy is identical, so the default stays ANE (validated). Tune per-rig
+                // via SAM3_COREML_MENC_UNIT if a thermally-stable bench shows a real win.
+                s_memenc = edgetam_coreml_create(mp, sam3_coreml_unit("SAM3_COREML_MENC_UNIT", /*ANE*/ 1));
                 if (s_memenc) fprintf(stderr, "%s: CoreML memenc loaded (ANE): %s\n", __func__, mp);
             }
         }
