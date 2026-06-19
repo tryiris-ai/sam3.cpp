@@ -12,6 +12,12 @@
 #include "ggml-metal.h"
 #endif
 
+// RFD 0011 (Windows/Linux cross-vendor GPU): the ggml-Vulkan backend covers
+// AMD/NVIDIA/Intel from one build (SAM3_VULKAN). The model loader selects it below.
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+
 /* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -3423,6 +3429,14 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     if (params.use_gpu) {
         fprintf(stderr, "%s: using Metal backend\n", __func__);
         model->backend = ggml_backend_metal_init();
+    }
+#endif
+#ifdef GGML_USE_VULKAN
+    // RFD 0011: cross-vendor GPU. ggml-Vulkan runs the same EdgeTAM graph on any
+    // Vulkan device (AMD/NVIDIA/Intel; Apple via MoltenVK). device 0 = first GPU.
+    if (params.use_gpu && !model->backend) {
+        fprintf(stderr, "%s: using Vulkan backend\n", __func__);
+        model->backend = ggml_backend_vk_init(0);
     }
 #endif
     if (!model->backend) {
