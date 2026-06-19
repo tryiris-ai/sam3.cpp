@@ -45,14 +45,17 @@ int main(int argc, char** argv){
     const char* GE = envOr("SAM3_COREML_MODELS", "/Users/noah.johnson/iris/audits/goldenclip-eval/coreml_models");
     auto P=[&](const char* f){ std::string s=GE; s+="/"; s+=f; return s; };
 
-    // heterogeneous placement (encoder ANE, mem-attn GPU; decoder/memenc default ANE, overridable)
-    int U_DEC = envUnit("SAM3_DEC_UNIT_N", 1), U_ME = envUnit("SAM3_MENC_UNIT_N", 1);
-    auto enc = edgetam_coreml_create(P("edgetam_encoder_neck_nhwc.mlpackage").c_str(), 1);
-    auto ma  = edgetam_coreml_create(P("edgetam_memory_attention.mlpackage").c_str(),  2);
+    // heterogeneous placement — ALL FOUR stages overridable for the M4 compute-unit
+    // sweep (RFD 0011 U8). 0=ALL 1=ANE 2=GPU 3=CPU. M1-era default: enc ANE, mem-attn
+    // GPU, decoder/memenc ANE — re-validate on M4 (the optimal units may invert).
+    int U_ENC = envUnit("SAM3_ENC_UNIT_N", 1), U_MA  = envUnit("SAM3_MA_UNIT_N",  2);
+    int U_DEC = envUnit("SAM3_DEC_UNIT_N", 1), U_ME  = envUnit("SAM3_MENC_UNIT_N", 1);
+    auto enc = edgetam_coreml_create(P("edgetam_encoder_neck_nhwc.mlpackage").c_str(), U_ENC);
+    auto ma  = edgetam_coreml_create(P("edgetam_memory_attention.mlpackage").c_str(),  U_MA);
     auto dec = edgetam_coreml_create(P("edgetam_mask_decoder_nhwc.mlpackage").c_str(),  U_DEC);
     auto me  = edgetam_coreml_create(P("edgetam_memory_encode.mlpackage").c_str(),      U_ME);
-    if(!enc||!ma||!dec||!me){ fprintf(stderr,"model load failed; set SAM3_COREML_MODELS=<dir with the 4 .mlpackages>\n"); return 1; }
-    printf("loaded enc(ANE)+memattn(GPU)+dec(unit%d)+memenc(unit%d)  N=%d warmup=%d\n", U_DEC, U_ME, N, WARMUP);
+    if(!enc||!ma||!dec||!me){ fprintf(stderr,"model load failed (enc=%d ma=%d dec=%d me=%d); a NULL = that stage's unit rejected the model\n", !!enc,!!ma,!!dec,!!me); return 1; }
+    printf("loaded enc(unit%d)+memattn(unit%d)+dec(unit%d)+memenc(unit%d)  N=%d warmup=%d\n", U_ENC, U_MA, U_DEC, U_ME, N, WARMUP);
 
     const size_t S_IMG=3*1024*1024, S_N0=256*256*256, S_N1=128*128*256, S_N2=64*64*256;
     const size_t S_CURR=4096*256, S_MEM=3648*64, S_PE=64*64*256, S_SP=256, S_MASKF=1024*1024;

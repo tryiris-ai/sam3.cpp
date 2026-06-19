@@ -226,9 +226,11 @@ int edgetam_coreml_memencode(edgetam_coreml_handle handle,
 
         id<MLFeatureProvider> out = [h->model predictionFromFeatures:fp error:&err];
         if (err || !out) { NSLog(@"[edgetam_coreml] memencode predict: %@", err); return 0; }
-        // Tuple output flattened to var_486 (latents) + var_488 (pos), each [1,512,64].
-        bool ok = copy_f32([[out featureValueForName:@"var_486"] multiArrayValue], mem_feats, (size_t)512*64)
-               && copy_f32([[out featureValueForName:@"var_488"] multiArrayValue], mem_pos,   (size_t)512*64);
+        // Stable named outputs from convert_memenc_coreml.py: mem_feats (latents) +
+        // mem_pos (position), each [1,512,64]. (Was var_486/var_488 — coremltools
+        // auto-names change per export; the convert now pins these names.)
+        bool ok = copy_f32([[out featureValueForName:@"mem_feats"] multiArrayValue], mem_feats, (size_t)512*64)
+               && copy_f32([[out featureValueForName:@"mem_pos"]   multiArrayValue], mem_pos,   (size_t)512*64);
         return ok ? 1 : 0;
     }
 }

@@ -12,6 +12,12 @@
 #include "ggml-metal.h"
 #endif
 
+// RFD 0011 (Windows/Linux cross-vendor GPU): the ggml-Vulkan backend covers
+// AMD/NVIDIA/Intel from one build (SAM3_VULKAN). The model loader selects it below.
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+
 /* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -3425,6 +3431,14 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         model->backend = ggml_backend_metal_init();
     }
 #endif
+#ifdef GGML_USE_VULKAN
+    // RFD 0011: cross-vendor GPU. ggml-Vulkan runs the same EdgeTAM graph on any
+    // Vulkan device (AMD/NVIDIA/Intel; Apple via MoltenVK). device 0 = first GPU.
+    if (params.use_gpu && !model->backend) {
+        fprintf(stderr, "%s: using Vulkan backend\n", __func__);
+        model->backend = ggml_backend_vk_init(0);
+    }
+#endif
     if (!model->backend) {
         fprintf(stderr, "%s: using CPU backend\n", __func__);
         model->backend = ggml_backend_cpu_init();
@@ -4974,6 +4988,40 @@ static void edgetam_build_repvit_graph(struct ggml_context* ctx,
 
 #ifdef SAM3_COREML
 #include "edgetam_coreml.h"
+
+// RFD 0011 U8 (threaded encoder-ahead): the producer thread runs preprocess +
+// CoreML encode for frame N+1 into s_prefetch_neck while the main thread runs the
+// consumer (assembly+memattn+decode+memencode+bank) for frame N. When a prefetched
+// neck is ready, the main thread's encode step copies it (skipping BOTH preprocess
+// and the CoreML encode), so the ~17 ms encoder leg overlaps the ~52 ms consumer.
+// SPSC: the bench serializes set→consume per frame, so no lock is needed here.
+static std::vector<float> s_prefetch_neck[3];
+static bool s_prefetch_ready = false;
+
+// RFD 0011 U8 — per-chip CoreML compute-unit profile (0=ALL 1=ANE 2=GPU 3=CPU).
+// M4 Pro sweep (sam3_coreml_pipeline, isolated 20-rep median): encoder ANE 11ms
+// (GPU 14, CPU 38), mem-attn GPU 17ms (ANE 26, CPU 24), decoder ANE 7.8ms (GPU 8.2),
+// memenc ANE 5.0 / GPU 3.9. Defaults = the validated M4 optimum (enc ANE, mem-attn
+// GPU, decoder ANE, memenc ANE — memenc's isolated GPU edge washes out in thermal
+// noise end-to-end). NOT inverted vs M1 like the ORT/EfficientTAM stack. Override
+// per chip via env (e.g. SAM3_COREML_MA_UNIT=1) if M1/M2/M3 profiles differ.
+static int sam3_coreml_unit(const char* env, int def) {
+    const char* v = getenv(env);
+    return (v && *v) ? atoi(v) : def;
+}
+
+void sam3_coreml_set_prefetched_neck(const float* n0, const float* n1, const float* n2) {
+    const int Wd[3] = {256, 128, 64}, D = 256;
+    const float* src[3] = {n0, n1, n2};
+    for (int i = 0; i < 3; ++i)
+        s_prefetch_neck[i].assign(src[i], src[i] + (size_t)D * Wd[i] * Wd[i]);
+    s_prefetch_ready = true;
+}
+// Exposed for the producer thread (preprocess off the main thread).
+std::vector<float> sam3_coreml_preprocess_image(const sam3_image& image, int img_size) {
+    return sam2_preprocess_image(image, img_size);
+}
+
 // RFD 0011 (CoreML/ANE hybrid): run the EdgeTAM encoder on CoreML/ANE (~12 ms)
 // instead of the ggml/Metal RepViT (~122 ms) and load the ggml-matching 256-ch
 // neck features into state.neck_trk. The CoreML model exports neck(trunk(x))[0:3]
@@ -4984,10 +5032,10 @@ static bool edgetam_encode_image_coreml(sam3_state& state, const sam3_model& mod
                                         const sam3_image& image,
                                         const std::vector<float>& img_norm) {
     static edgetam_coreml_handle s_enc = nullptr;
-    if (!s_enc) {
+    if (!s_prefetch_ready && !s_enc) {  // prefetch path needs no local encoder handle
         const char* mp = getenv("SAM3_COREML_MODEL");
         if (!mp) { fprintf(stderr, "%s: SAM3_COREML_ENCODER set but SAM3_COREML_MODEL unset\n", __func__); return false; }
-        s_enc = edgetam_coreml_create(mp, /*compute_units=ANE*/ 1);
+        s_enc = edgetam_coreml_create(mp, sam3_coreml_unit("SAM3_COREML_ENC_UNIT", /*ANE*/ 1));
         if (!s_enc) { fprintf(stderr, "%s: CoreML encoder load failed\n", __func__); return false; }
         fprintf(stderr, "%s: CoreML EdgeTAM encoder loaded (ANE): %s\n", __func__, mp);
     }
@@ -5003,7 +5051,10 @@ static bool edgetam_encode_image_coreml(sam3_state& state, const sam3_model& mod
     static std::vector<float> nbuf[3];
     for (int i = 0; i < 3; ++i) nbuf[i].resize((size_t)D * Wd[i] * Hd[i]);
 
-    {
+    if (s_prefetch_ready) {  // threaded: producer already encoded this frame off-thread
+        for (int i = 0; i < 3; ++i) nbuf[i].swap(s_prefetch_neck[i]);
+        s_prefetch_ready = false;
+    } else {
         SAM3_TIME_SCOPE(image_encoder_compute_ms);   // the ANE inference itself
         if (!edgetam_coreml_encode(s_enc, img_norm.data(),
                                    nbuf[0].data(), nbuf[1].data(), nbuf[2].data()))
@@ -5066,6 +5117,21 @@ static bool edgetam_encode_image(sam3_state& state,
     state.orig_width = image.width;
     state.orig_height = image.height;
 
+#ifdef SAM3_COREML
+    // RFD 0011 (CoreML/ANE hybrid): when enabled, run the encoder on CoreML/ANE
+    // and skip the ggml RepViT+FPN graph entirely. Threaded (encoder-ahead): when a
+    // prefetched neck is ready the producer already did preprocess + encode off-thread,
+    // so skip preprocess here too — the helper consumes the prefetched neck.
+    if (getenv("SAM3_COREML_ENCODER")) {
+        std::vector<float> cml_img;
+        if (!s_prefetch_ready) {
+            SAM3_TIME_SCOPE(preprocess_ms);
+            cml_img = sam2_preprocess_image(image, img_size);  // NCHW [1,3,1024,1024]
+        }
+        return edgetam_encode_image_coreml(state, model, image, cml_img);
+    }
+#endif
+
     // ── Preprocess (same ImageNet normalization as SAM2) ─────────────────
     // RFD 0011 U0: preprocess timed separately from the graph build/alloc/compute.
     std::vector<float> img_data;
@@ -5073,16 +5139,6 @@ static bool edgetam_encode_image(sam3_state& state,
         SAM3_TIME_SCOPE(preprocess_ms);
         img_data = sam2_preprocess_image(image, img_size);
     }
-
-#ifdef SAM3_COREML
-    // RFD 0011 (CoreML/ANE hybrid): when enabled, run the encoder on CoreML/ANE
-    // and skip the ggml RepViT+FPN graph entirely. img_data is already NCHW
-    // [1,3,1024,1024] (ggml inp ne=[W,H,C] == numpy NCHW), so it hands straight
-    // to CoreML; only the 256-ch neck outputs need a layout permute (in helper).
-    if (getenv("SAM3_COREML_ENCODER")) {
-        return edgetam_encode_image_coreml(state, model, image, img_data);
-    }
-#endif
 
     // ── Build graph ──────────────────────────────────────────────────────
     // RFD 0011 U0: graph CONSTRUCTION region (image_encoder_build_ms). U1 will
@@ -11611,42 +11667,40 @@ static sam3_prop_output sam3_propagate_single(
         if (ptr_tpos[p] < 1) ptr_tpos[p] = 1;  // minimum distance of 1
     }
 
+#ifdef SAM3_COREML
+    // RFD 0011 U8 Wave 1: force full mem-attn capacity (num_maskmem spatial slots +
+    // max_obj_ptrs pointer slots = 3648 tokens) from frame 1, so the CoreML mem-attn
+    // engages EVERY frame instead of falling back to ggml on early (not-yet-full)
+    // frames. Required to test a consistent all-CoreML pipeline (CoreML memencode
+    // slots must not be fed to the ggml mem-attn). Pad spatial slots by repeating the
+    // most-recent slot; pad pointers with no_obj_ptr at a far temporal distance.
+    if (getenv("SAM3_COREML_PAD_BANK") && use_perceiver && !slot_feats.empty()) {
+        while ((int)slot_feats.size() < hp.num_maskmem) {
+            slot_feats.push_back(slot_feats.back());
+            slot_pes.push_back(slot_pes.back());
+            spatial_tpos.push_back(spatial_tpos.back());
+        }
+        if (model.no_obj_ptr) {
+            std::vector<float> nop(D);
+            sam3_read_f32(model.no_obj_ptr, nop.data(), D);
+            while ((int)obj_ptrs.size() < hp.max_obj_ptrs) {
+                obj_ptrs.push_back(nop);
+                ptr_tpos.push_back(hp.max_obj_ptrs);
+            }
+        }
+    }
+#endif
     auto pd = sam3_build_prompt_and_pos(model, slot_feats, slot_pes, spatial_tpos, obj_ptrs, ptr_tpos, H);
 
     // ── RoPE frequencies (cached) ──────────────────────────────────────
     sam3_ensure_tracker_pe_caches(tracker, hp, H);
     const int half_d = D / 2;  // 128
     const auto& rope_q_reord = tracker.cached_axial_cis_reord;
-    // For cross-attn K: build rope_k_data for all M_spatial tokens
+    // RFD 0011 U8 perf: rope_k_data feeds ONLY the ggml mem-attn fallback graph.
+    // The CoreML mem-attn path (below) uses cached_sinpe_256, never rope_k_data,
+    // so building it here is ~2 ms/frame of pure waste on the hot path. Moved to
+    // just before the ggml graph build, so it runs only when CoreML did NOT.
     std::vector<float> rope_k_data;
-    if (pd.M_spatial > 0) {
-        rope_k_data.resize(2 * half_d * pd.M_spatial);
-        if (use_perceiver) {
-            // EdgeTAM perceiver: each frame has N_per_slot=512 tokens.
-            // First 256 (1D latents): identity RoPE (cos=1, sin=0).
-            // Last 256 (2D latents): 16x16 RoPE from cached_axial_cis_k16_reord.
-            const int N_1d = hp.perceiver_n_latents_1d;   // 256
-            const int N_2d = hp.perceiver_n_latents_2d;   // 256
-            const auto& rope_k16 = tracker.cached_axial_cis_k16_reord;  // [2, 128, 256]
-            for (int s = 0; s < n_sel; ++s) {
-                float* dst = rope_k_data.data() + s * D * N_per_slot;
-                // 1D tokens: identity RoPE (cos=1, sin=0) in [2, half_d, N_1d] layout
-                // Layout: for token n, dim i: cos at [0 + i*2 + n*D], sin at [1 + i*2 + n*D]
-                for (int n = 0; n < N_1d; ++n)
-                    for (int i = 0; i < half_d; ++i) {
-                        dst[0 + i * 2 + n * D] = 1.0f;  // cos = 1
-                        dst[1 + i * 2 + n * D] = 0.0f;  // sin = 0
-                    }
-                // 2D tokens: copy 16x16 RoPE
-                float* dst_2d = dst + D * N_1d;
-                memcpy(dst_2d, rope_k16.data(), D * N_2d * sizeof(float));
-            }
-        } else {
-            // Standard: repeat HxH axial CIS for each memory frame
-            for (int s = 0; s < pd.M_spatial / N; ++s)
-                memcpy(rope_k_data.data() + s * D * N, rope_q_reord.data(), D * N * sizeof(float));
-        }
-    }
 
     // RFD 0011 (CoreML/ANE hybrid): run the memory attention on CoreML-GPU
     // (~18 ms vs ggml ~185 ms) at the fixed steady-state capacity (7 memory
@@ -11667,7 +11721,7 @@ static sam3_prop_output sam3_propagate_single(
             s_memattn_tried = true;
             const char* mp = getenv("SAM3_COREML_MEMATTN_MODEL");
             if (mp) {
-                s_memattn = edgetam_coreml_create(mp, /*CPU_AND_GPU*/ 2);
+                s_memattn = edgetam_coreml_create(mp, sam3_coreml_unit("SAM3_COREML_MA_UNIT", /*GPU*/ 2));
                 if (s_memattn) fprintf(stderr, "%s: CoreML mem-attn loaded (GPU): %s\n", __func__, mp);
             }
         }
@@ -11695,7 +11749,7 @@ static sam3_prop_output sam3_propagate_single(
             s_decoder_tried = true;
             const char* mp = getenv("SAM3_COREML_DECODER_MODEL");
             if (mp) {
-                s_decoder = edgetam_coreml_create(mp, /*CPU_AND_NE*/ 1);
+                s_decoder = edgetam_coreml_create(mp, sam3_coreml_unit("SAM3_COREML_DEC_UNIT", /*ANE*/ 1));
                 if (s_decoder) fprintf(stderr, "%s: CoreML decoder loaded (ANE): %s\n", __func__, mp);
             }
         }
@@ -11730,6 +11784,36 @@ static sam3_prop_output sam3_propagate_single(
         }
     }
 #endif
+
+    // RFD 0011 U8 perf: build rope_k_data HERE — only reached when the CoreML
+    // mem-attn/decoder path above did NOT return (fallback to the ggml graph).
+    if (pd.M_spatial > 0) {
+        rope_k_data.resize(2 * half_d * pd.M_spatial);
+        if (use_perceiver) {
+            // EdgeTAM perceiver: each frame has N_per_slot=512 tokens.
+            // First 256 (1D latents): identity RoPE (cos=1, sin=0).
+            // Last 256 (2D latents): 16x16 RoPE from cached_axial_cis_k16_reord.
+            const int N_1d = hp.perceiver_n_latents_1d;   // 256
+            const int N_2d = hp.perceiver_n_latents_2d;   // 256
+            const auto& rope_k16 = tracker.cached_axial_cis_k16_reord;  // [2, 128, 256]
+            for (int s = 0; s < n_sel; ++s) {
+                float* dst = rope_k_data.data() + s * D * N_per_slot;
+                // 1D tokens: identity RoPE (cos=1, sin=0) in [2, half_d, N_1d] layout
+                for (int n = 0; n < N_1d; ++n)
+                    for (int i = 0; i < half_d; ++i) {
+                        dst[0 + i * 2 + n * D] = 1.0f;  // cos = 1
+                        dst[1 + i * 2 + n * D] = 0.0f;  // sin = 0
+                    }
+                // 2D tokens: copy 16x16 RoPE
+                float* dst_2d = dst + D * N_1d;
+                memcpy(dst_2d, rope_k16.data(), D * N_2d * sizeof(float));
+            }
+        } else {
+            // Standard: repeat HxH axial CIS for each memory frame
+            for (int s = 0; s < pd.M_spatial / N; ++s)
+                memcpy(rope_k_data.data() + s * D * N, rope_q_reord.data(), D * N * sizeof(float));
+        }
+    }
 
     // ── Build graph ─────────────────────────────────────────────────────
     // RFD 0011 U0: mem-attn + SAM mask decoder graph CONSTRUCTION region
@@ -12106,6 +12190,83 @@ static bool sam3_encode_memory(
 
     // Mask preprocessing: mask_logits → HIGH_RES → sigmoid → scale/bias → INTERPOL
     auto m_hires = sam3_bilinear_interpolate(mask_logits, mask_w, mask_h, HIGH_RES, HIGH_RES);
+#ifdef SAM3_COREML
+    // RFD 0011 U8 Wave 1: CoreML memory-encode (memory_encoder + spatial_perceiver,
+    // ~6ms ANE vs ~24ms ggml). ⚠️ DO NOT USE IN THE ggml-ORCHESTRATED TRACKER.
+    // SPEED VERIFIED (7.8→10.86 fps, mem_encoder 24→0ms) but ACCURACY BROKEN
+    // (goldeneval dt0004 0.000). DIAGNOSED via the parity probe below: vs the ggml
+    // edgetam_perceiver_forward slot, pos cos=1.000 but **feats cos≈0.85** on
+    // IDENTICAL pix_feat+mask (pix_feat HWC→BCHW transpose verified — the H/W-swapped
+    // variant scores 0.43, far worse; mask sigmoid/scale is not the driver). So the
+    // gap is a genuine REPRESENTATION difference between the ggml perceiver and the
+    // CoreML spatial_perceiver (different magnitudes). The ggml assembly + tpos +
+    // mem-attn are calibrated to the ggml representation, so a 0.85-different slot
+    // breaks the track. CONCLUSION: 20fps needs a FULLY pure-CoreML tracker (the
+    // sam3_coreml_pipeline path + a real bank + ggml-seed), not this hybrid drop-in.
+    // Gated OFF by default (env SAM3_COREML_MEMENC); the ggml memencode below is the
+    // correct path for the hybrid.
+    // The exported model applies the mask sigmoid internally
+    // (convert_memenc_coreml.py: skip_mask_sigmoid=False), so it takes RAW logits at
+    // HIGH_RES — i.e. m_hires BEFORE the sigmoid below. pix_feat is neck2 transposed
+    // from ggml HWC (channel-fastest) to BCHW. Output is the perceiver slot
+    // (== the ggml path's perc_latents/perc_pos), stored identically. Returns early,
+    // skipping the per-frame ggml memencode graph entirely.
+    if (getenv("SAM3_COREML_MEMENC") && hp.has_perceiver) {
+        static edgetam_coreml_handle s_memenc = nullptr;
+        static bool s_memenc_tried = false;
+        if (!s_memenc && !s_memenc_tried) {
+            s_memenc_tried = true;
+            const char* mp = getenv("SAM3_COREML_MEMENC_MODEL");
+            if (mp) {
+                // memenc GPU is ~1.1ms faster in isolation (M4 bench: 3.9 vs ANE 5.0) but the
+                // win is WITHIN thermal run-to-run noise end-to-end (A/B inconclusive) and
+                // accuracy is identical, so the default stays ANE (validated). Tune per-rig
+                // via SAM3_COREML_MENC_UNIT if a thermally-stable bench shows a real win.
+                s_memenc = edgetam_coreml_create(mp, sam3_coreml_unit("SAM3_COREML_MENC_UNIT", /*ANE*/ 1));
+                if (s_memenc) fprintf(stderr, "%s: CoreML memenc loaded (ANE): %s\n", __func__, mp);
+            }
+        }
+        if (s_memenc) {
+            std::vector<float> n2((size_t)D * H * H), pix_chw((size_t)D * H * H);
+            ggml_backend_tensor_get(state.neck_trk[2], n2.data(), 0, (size_t)D * H * H * sizeof(float));
+            for (int h = 0; h < H; ++h)
+                for (int w = 0; w < H; ++w)
+                    for (int c = 0; c < D; ++c)
+                        pix_chw[(size_t)c * H * H + (size_t)h * H + w] = n2[(size_t)c + ((size_t)h * H + w) * D];
+            const int N_perc = hp.perceiver_n_latents_1d + hp.perceiver_n_latents_2d;  // 512
+            std::vector<float> mfeat((size_t)MD * N_perc), mpos((size_t)MD * N_perc);
+            if (edgetam_coreml_memencode(s_memenc, pix_chw.data(), m_hires.data(), mfeat.data(), mpos.data())) {
+                if (!tracker.ctx) {
+                    struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
+                    tracker.ctx = ggml_init(tp);
+                }
+                auto store_slot = [&](const std::vector<float>& src) {
+                    auto* t = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, MD, N_perc);
+                    auto* b = ggml_backend_alloc_buffer(model.backend, (size_t)MD * N_perc * sizeof(float));
+                    struct ggml_tallocr a = ggml_tallocr_new(b);
+                    ggml_tallocr_alloc(&a, t);
+                    tracker.owned_buffers.push_back(b);
+                    ggml_backend_tensor_set(t, src.data(), 0, (size_t)MD * N_perc * sizeof(float));
+                    return t;
+                };
+                sam3_memory_slot slot;
+                slot.spatial_feats = store_slot(mfeat);
+                slot.spatial_pe = store_slot(mpos);
+                slot.frame_index = frame_idx;
+                slot.is_cond_frame = is_cond;
+                auto& bk = tracker.mem_banks[inst_id];
+                bk.push_back(slot);
+                while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
+                    bool removed = false;
+                    for (auto it = bk.begin(); it != bk.end(); ++it)
+                        if (!it->is_cond_frame) { bk.erase(it); removed = true; break; }
+                    if (!removed) bk.erase(bk.begin() + 1);
+                }
+                return true;
+            }
+        }
+    }
+#endif
     const float sig_scale = hp.sigmoid_scale(), sig_bias = hp.sigmoid_bias();
     for (auto& v : m_hires) { float s = 1.0f / (1.0f + expf(-v)); v = s * sig_scale + sig_bias; }
     auto m_interp = sam3_bilinear_interpolate(m_hires.data(), HIGH_RES, HIGH_RES, INTERPOL, INTERPOL);
@@ -12240,8 +12401,48 @@ static bool sam3_encode_memory(
             return false;
         }
 
-        // Store perceiver output: [MD=64, N_perc] (N_1d + N_2d latents)
         const int N_perc = hp.perceiver_n_latents_1d + hp.perceiver_n_latents_2d;
+#ifdef SAM3_COREML
+        // RFD 0011 U8 Wave 1: memencode parity probe. Run the ggml path AND set
+        // SAM3_COREML_MEMENC_PARITY(+_MODEL) to cosine-compare the CoreML memencode
+        // slot against this ggml perceiver slot, per axis, to find the wrong one.
+        if (getenv("SAM3_COREML_MEMENC_PARITY")) {
+            static edgetam_coreml_handle s_pe = nullptr;
+            static bool s_pe_tried = false;
+            if (!s_pe && !s_pe_tried) {
+                s_pe_tried = true;
+                const char* mp = getenv("SAM3_COREML_MEMENC_MODEL");
+                if (mp) s_pe = edgetam_coreml_create(mp, 1);
+            }
+            if (s_pe) {
+                auto raw = sam3_bilinear_interpolate(mask_logits, mask_w, mask_h, HIGH_RES, HIGH_RES);
+                std::vector<float> n2((size_t)D * H * H), pc((size_t)D * H * H);
+                ggml_backend_tensor_get(state.neck_trk[2], n2.data(), 0, (size_t)D * H * H * sizeof(float));
+                for (int hh = 0; hh < H; ++hh)
+                    for (int ww = 0; ww < H; ++ww)
+                        for (int cc = 0; cc < D; ++cc)
+                            pc[(size_t)cc * H * H + (size_t)hh * H + ww] = n2[(size_t)cc + ((size_t)hh * H + ww) * D];
+                auto cosab = [](const std::vector<float>& a, const std::vector<float>& b) {
+                    double d = 0, na = 0, nb = 0; size_t n = std::min(a.size(), b.size());
+                    for (size_t i = 0; i < n; ++i) { d += (double)a[i] * b[i]; na += (double)a[i] * a[i]; nb += (double)b[i] * b[i]; }
+                    return (na > 0 && nb > 0) ? d / (sqrt(na) * sqrt(nb)) : 0.0;
+                };
+                std::vector<float> mf((size_t)MD * N_perc), mp2((size_t)MD * N_perc);
+                edgetam_coreml_memencode(s_pe, pc.data(), raw.data(), mf.data(), mp2.data());  // current transpose (c,h,w)
+                // pix_feat with H/W swapped (write to (c,w,h)) — tests a spatial transpose bug
+                std::vector<float> pcS((size_t)D * H * H);
+                for (int hh = 0; hh < H; ++hh)
+                    for (int ww = 0; ww < H; ++ww)
+                        for (int cc = 0; cc < D; ++cc)
+                            pcS[(size_t)cc * H * H + (size_t)ww * H + hh] = n2[(size_t)cc + ((size_t)hh * H + ww) * D];
+                std::vector<float> mfS((size_t)MD * N_perc), mpS((size_t)MD * N_perc);
+                edgetam_coreml_memencode(s_pe, pcS.data(), raw.data(), mfS.data(), mpS.data());
+                fprintf(stderr, "MEMENC_PARITY f%d: feats cos transpose=%.4f swapHW=%.4f  pos cos=%.4f\n",
+                        frame_idx, cosab(perc_latents, mf), cosab(perc_latents, mfS), cosab(perc_pos, mp2));
+            }
+        }
+#endif
+        // Store perceiver output: [MD=64, N_perc] (N_1d + N_2d latents)
         auto* st = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, MD, N_perc);
         auto* sb = ggml_backend_alloc_buffer(model.backend, MD * N_perc * sizeof(float));
         struct ggml_tallocr ta_perc = ggml_tallocr_new(sb);
@@ -12921,6 +13122,17 @@ sam3_result sam3_propagate_frame(
             pm[id].data.resize(state.orig_width * state.orig_height);
             for (int p = 0; p < (int)rs.size(); ++p)
                 pm[id].data[p] = rs[p] > 0.0f ? 255 : 0;
+        } else {
+            // RFD 0011 U8 mask export: a cheap LOW-RES binary mask straight off the
+            // decoder's ~256x256 logit grid (no full-res upscale → keeps the U2
+            // fast-path perf). pm carries it to the result detection (~13315) so the
+            // C-ABI/State-Sync can ship it; the frontend upsamples to the video.
+            const int mw = po[id].mask_w, mh = po[id].mask_h;
+            pm[id].width = mw;
+            pm[id].height = mh;
+            pm[id].data.resize((size_t)mw * mh);
+            for (int p = 0; p < mw * mh; ++p)
+                pm[id].data[p] = po[id].mask_logits[p] > 0.0f ? 255 : 0;
         }
         ml.last_score = po[id].iou_scores[0];
         ml.last_seen = fi;
@@ -13109,8 +13321,10 @@ sam3_result sam3_propagate_frame(
         det.mask.iou_score   = score;
         auto pit = po.find(inst_id);
         if (pit != po.end()) det.mask.obj_score = pit->second.obj_score;
-        // Attach full-res mask pixels only if we built them (debug/overlay).
-        if (want_fullres) {
+        // Attach the mask pixels: low-res grid by default (RFD 0011 U8 export, for
+        // State-Sync/frontend display), full-res when SAM3_FULLRES_MASK. Both were
+        // built into pm above; emit whichever is present.
+        {
             auto it = pm.find(inst_id);
             if (it != pm.end()) {
                 det.mask.width  = it->second.width;

@@ -104,13 +104,23 @@ def patch_perceiver(perc):
 
 class MemEnc(nn.Module):
     """memory_encoder + spatial_perceiver, the per-frame memory-write compute (stage 4)."""
-    def __init__(self, mem_enc, perceiver):
+    def __init__(self, mem_enc, perceiver, sigmoid_scale=1.0, sigmoid_bias=0.0):
         super().__init__()
         self.mem_enc = mem_enc
         self.perceiver = perceiver
+        self.sigmoid_scale = sigmoid_scale
+        self.sigmoid_bias = sigmoid_bias
 
     def forward(self, pix_feat, mask_logits):
-        out = self.mem_enc(pix_feat, mask_logits, skip_mask_sigmoid=False)
+        # FIX (RFD 0011 U8): replicate _encode_new_memory's mask processing exactly —
+        # sigmoid(mask) * sigmoid_scale_for_mem_enc + sigmoid_bias_for_mem_enc
+        # (EdgeTAM: 20.0 / -10.0), THEN skip the encoder's own sigmoid. The prior
+        # export used skip_mask_sigmoid=False (sigmoid only, no scale/bias), feeding the
+        # encoder a [0,1] mask vs the tracker's [-10,10] — which broke the slot
+        # (goldeneval 0.000 / proto 0.022). With scale+bias baked in, the model takes
+        # RAW logits and matches the tracker (proto 1.000; C++ 4-stage 0.94 @ ~14fps).
+        mask_for_mem = torch.sigmoid(mask_logits) * self.sigmoid_scale + self.sigmoid_bias
+        out = self.mem_enc(pix_feat, mask_for_mem, skip_mask_sigmoid=True)
         feats = out["vision_features"]
         pos = out["vision_pos_enc"][0]
         feats, pos = self.perceiver(feats, pos)
@@ -119,7 +129,9 @@ class MemEnc(nn.Module):
 
 def main():
     model = build_model()
-    w = MemEnc(model.memory_encoder, model.spatial_perceiver).eval()
+    w = MemEnc(model.memory_encoder, model.spatial_perceiver,
+               sigmoid_scale=float(model.sigmoid_scale_for_mem_enc),
+               sigmoid_bias=float(model.sigmoid_bias_for_mem_enc)).eval()
 
     pix_feat = torch.randn(1, C_PIX, H, W)
     mask = torch.randn(1, 1, 1024, 1024)
@@ -157,6 +169,9 @@ def main():
         frozen,
         inputs=[ct.TensorType(name="pix_feat", shape=pix_feat.shape, dtype=np.float32),
                 ct.TensorType(name="mask_logits", shape=mask.shape, dtype=np.float32)],
+        # Stable output names so the .mm/cgo bridge doesn't depend on coremltools
+        # auto-naming (var_NNN), which changes per export. (feats, pos) order.
+        outputs=[ct.TensorType(name="mem_feats"), ct.TensorType(name="mem_pos")],
         minimum_deployment_target=ct.target.iOS17,
         compute_units=ct.ComputeUnit.ALL,
         convert_to="mlprogram",
