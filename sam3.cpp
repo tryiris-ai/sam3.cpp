@@ -13122,6 +13122,17 @@ sam3_result sam3_propagate_frame(
             pm[id].data.resize(state.orig_width * state.orig_height);
             for (int p = 0; p < (int)rs.size(); ++p)
                 pm[id].data[p] = rs[p] > 0.0f ? 255 : 0;
+        } else {
+            // RFD 0011 U8 mask export: a cheap LOW-RES binary mask straight off the
+            // decoder's ~256x256 logit grid (no full-res upscale → keeps the U2
+            // fast-path perf). pm carries it to the result detection (~13315) so the
+            // C-ABI/State-Sync can ship it; the frontend upsamples to the video.
+            const int mw = po[id].mask_w, mh = po[id].mask_h;
+            pm[id].width = mw;
+            pm[id].height = mh;
+            pm[id].data.resize((size_t)mw * mh);
+            for (int p = 0; p < mw * mh; ++p)
+                pm[id].data[p] = po[id].mask_logits[p] > 0.0f ? 255 : 0;
         }
         ml.last_score = po[id].iou_scores[0];
         ml.last_seen = fi;
@@ -13310,8 +13321,10 @@ sam3_result sam3_propagate_frame(
         det.mask.iou_score   = score;
         auto pit = po.find(inst_id);
         if (pit != po.end()) det.mask.obj_score = pit->second.obj_score;
-        // Attach full-res mask pixels only if we built them (debug/overlay).
-        if (want_fullres) {
+        // Attach the mask pixels: low-res grid by default (RFD 0011 U8 export, for
+        // State-Sync/frontend display), full-res when SAM3_FULLRES_MASK. Both were
+        // built into pm above; emit whichever is present.
+        {
             auto it = pm.find(inst_id);
             if (it != pm.end()) {
                 det.mask.width  = it->second.width;

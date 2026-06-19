@@ -116,6 +116,21 @@ int main(int argc, char** argv) {
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     producer.join();
+
+    // RFD 0011 U8 mask export check: pull the last track's mask via the C-ABI.
+    {
+        int mw = 0, mh = 0;
+        int need = edgetam_capi_last_mask(h, nullptr, 0, &mw, &mh);
+        if (need > 0) {
+            std::vector<uint8_t> mbuf(need);
+            edgetam_capi_last_mask(h, mbuf.data(), need, &mw, &mh);
+            size_t fg = 0; for (auto v : mbuf) if (v) ++fg;
+            printf("MASK export: last frame %dx%d, %zu foreground px (%.1f%% of frame)\n",
+                   mw, mh, fg, 100.0 * (double)fg / (double)need);
+        } else {
+            printf("MASK export: EMPTY on last frame (w=%d h=%d) — mask not populated on cgo path\n", mw, mh);
+        }
+    }
     double wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     printf("\nCAPI THREADED: %.2f fps  (%.1f ms over %d hold frames, encoder-ahead via capi)\n",
            (n_frames - 1) * 1000.0 / wall_ms, wall_ms, n_frames - 1);

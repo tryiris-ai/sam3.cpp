@@ -28,6 +28,11 @@ struct EtTracker {
     edgetam_coreml_handle prod_enc = nullptr;
     static const int      POOL = 3;
     std::vector<float>    neck[POOL][3];   // n0 256*256*256, n1 128*128*256, n2 64*64*256
+
+    // RFD 0011 U8 mask export: the last track's binary mask (0/255, orig-frame
+    // resolution), stashed so the Go side can pull the pixels after a track()
+    // for State-Sync/frontend rendering. Cleared on a lost frame.
+    sam3_mask last_mask;
 };
 
 // Wrap a caller RGB24 buffer as a sam3_image (copies into the owned vector — the
@@ -125,8 +130,9 @@ extern "C" et_result edgetam_capi_track(edgetam_tracker_t h, const uint8_t* rgb,
     try {
         sam3_image img = make_image(rgb, w, hgt);
         sam3_result res = sam3_propagate_frame(*t->tracker, *t->state, *t->model, img);
-        if (res.detections.empty()) return r;  // valid stays 0 -> lost
+        if (res.detections.empty()) { t->last_mask = sam3_mask{}; return r; }  // lost -> clear mask
         const sam3_detection& d = res.detections[0];
+        t->last_mask = d.mask;  // stash for edgetam_capi_last_mask
         const float W = (float)w, H = (float)hgt;
         r.box.x0 = d.box.x0 / W; r.box.y0 = d.box.y0 / H;
         r.box.x1 = d.box.x1 / W; r.box.y1 = d.box.y1 / H;
@@ -138,6 +144,22 @@ extern "C" et_result edgetam_capi_track(edgetam_tracker_t h, const uint8_t* rgb,
     } catch (...) {
         return r;
     }
+}
+
+// Copies the last track's binary mask (0/255, row-major, w*h bytes) into `out`
+// (capacity `cap`). Writes dims to *w,*h. Returns the mask byte count (w*h); if
+// cap < w*h it copies nothing and returns w*h so the caller can size the buffer.
+// 0 => no mask this frame (lost / not yet tracked). RFD 0011 U8 mask export.
+extern "C" int edgetam_capi_last_mask(edgetam_tracker_t h, uint8_t* out, int cap, int* w, int* hgt) {
+    auto* t = static_cast<EtTracker*>(h);
+    if (!t) return 0;
+    const sam3_mask& m = t->last_mask;
+    const int n = (int)m.data.size();
+    if (w) *w = m.width;
+    if (hgt) *hgt = m.height;
+    if (n == 0) return 0;
+    if (out && cap >= n) std::memcpy(out, m.data.data(), (size_t)n);
+    return n;
 }
 
 extern "C" void edgetam_capi_reset(edgetam_tracker_t h) {
@@ -204,8 +226,9 @@ extern "C" et_result edgetam_capi_track_slot(edgetam_tracker_t h, int slot,
 #endif
         sam3_image img = make_image(rgb, w, hgt);
         sam3_result res = sam3_propagate_frame(*t->tracker, *t->state, *t->model, img);
-        if (res.detections.empty()) return r;
+        if (res.detections.empty()) { t->last_mask = sam3_mask{}; return r; }
         const sam3_detection& d = res.detections[0];
+        t->last_mask = d.mask;  // stash for edgetam_capi_last_mask
         const float W = (float)w, H = (float)hgt;
         r.box.x0 = d.box.x0 / W; r.box.y0 = d.box.y0 / H;
         r.box.x1 = d.box.x1 / W; r.box.y1 = d.box.y1 / H;
