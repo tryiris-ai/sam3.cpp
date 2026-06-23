@@ -3538,6 +3538,13 @@ void sam3_free_model(sam3_model& model) {
     }
 }
 
+const char* sam3_backend_name(const sam3_model& model) {
+    // ggml_backend_name returns a static string owned by ggml; safe to hand across
+    // the C-ABI without copying. model.backend is set by sam3_load_model's
+    // preference chain (CUDA/Vulkan/Metal/CPU).
+    return model.backend ? ggml_backend_name(model.backend) : "none";
+}
+
 bool sam3_is_visual_only(const sam3_model& model) {
     return model.hparams.visual_only != 0 || model.hparams.is_sam2() || model.hparams.is_edgetam();
 }

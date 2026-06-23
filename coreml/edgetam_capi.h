@@ -65,6 +65,11 @@ void        edgetam_capi_reset(edgetam_tracker_t t);
 void        edgetam_capi_destroy(edgetam_tracker_t t);
 const char* edgetam_capi_version(void);   // SAM3_VERSION, for cgo link sanity
 
+// Active ggml backend name (e.g. "CUDA0", "Vulkan0", "Metal", "CPU", or "none").
+// Lets the Go side assert the GPU backend really initialized — catching a silent
+// CPU fallback that would be "fast and wrong" (cf. Egor part-2 CUDA 12/13 mismatch).
+const char* edgetam_capi_backend(edgetam_tracker_t t);
+
 #ifdef __cplusplus
 }
 #endif

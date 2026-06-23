@@ -245,3 +245,10 @@ extern "C" et_result edgetam_capi_track_slot(edgetam_tracker_t h, int slot,
 extern "C" const char* edgetam_capi_version(void) {
     return SAM3_VERSION;
 }
+
+extern "C" const char* edgetam_capi_backend(edgetam_tracker_t h) {
+    auto* t = static_cast<EtTracker*>(h);
+    // *t->model matches the existing capi pattern (sam3_encode_image(*t->state,
+    // *t->model, ...)); sam3_backend_name reads the model's active ggml backend.
+    return (t && t->model) ? sam3_backend_name(*t->model) : "none";
+}

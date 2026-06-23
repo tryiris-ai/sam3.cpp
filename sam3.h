@@ -222,6 +222,11 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params & params);
 /* Free all resources held by a loaded model. */
 void sam3_free_model(sam3_model & model);
 
+// Active ggml backend name for the loaded model (e.g. "CUDA0", "Vulkan0", "Metal",
+// "CPU"). Lets callers verify the GPU accelerator actually initialized rather than
+// silently falling back to CPU. Returns "none" if no backend is set.
+const char* sam3_backend_name(const sam3_model& model);
+
 /* Returns true if the model was loaded as visual-only (no text/detector path).
 ** SAM2 models are always considered visual-only. */
 bool sam3_is_visual_only(const sam3_model & model);
