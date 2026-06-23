@@ -18,6 +18,13 @@
 #include "ggml-vulkan.h"
 #endif
 
+// RFD 0011 (NVIDIA fast-path): ggml-CUDA backend for NVIDIA GPUs (SAM3_CUDA →
+// GGML_CUDA → GGML_USE_CUDA). The model loader selects it below, preferred over
+// Vulkan when both are compiled (a fat build).
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 /* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -3429,6 +3436,18 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
     if (params.use_gpu) {
         fprintf(stderr, "%s: using Metal backend\n", __func__);
         model->backend = ggml_backend_metal_init();
+    }
+#endif
+#ifdef GGML_USE_CUDA
+    // NVIDIA fast-path. ggml-CUDA runs the EdgeTAM graph with tensor-core FP16
+    // kernels, CUDA graphs, and FlashAttention. Preferred over Vulkan when both are
+    // compiled in (a fat NVIDIA build). device 0 = first CUDA GPU. Returns NULL if
+    // there is no CUDA device/driver (or a CUDA 12/13 lib mismatch) — the chain then
+    // falls through to Vulkan, then CPU. We log the selection so a silent CPU
+    // fallback is visible (cf. Egor part-2: "always check which provider ran").
+    if (params.use_gpu && !model->backend) {
+        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+        model->backend = ggml_backend_cuda_init(0);
     }
 #endif
 #ifdef GGML_USE_VULKAN
