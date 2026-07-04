@@ -38,6 +38,13 @@ endif()
 option(SAM3_CUDA "Enable the ggml-CUDA backend (NVIDIA GPUs)" OFF)
 if(NOT APPLE AND SAM3_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    # CUDA graphs: standalone ggml defaults GGML_CUDA_GRAPHS to OFF (llama.cpp
+    # flips it on in its own build). Without it, every frame pays per-kernel
+    # launch overhead across the EdgeTAM graph's hundreds of small kernels.
+    # Force it ON so the advertised "tensor-core FP16 + CUDA graphs" path is
+    # actually compiled; ggml auto-falls back to normal kernel launches at
+    # runtime for graphs it cannot capture, so this is safe.
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 endif()
 
 add_subdirectory(ggml)
@@ -91,12 +98,32 @@ endif()
 
 # RFD 0011 (Windows/Vulkan + NVIDIA/CUDA): reuse the cgo tracker C-ABI on the
 # non-Apple GPU paths WITHOUT the CoreML bridge. edgetam_capi.cpp's CoreML stage
-# calls + producer-encoder pool are #ifdef SAM3_COREML-guarded, so here the tracker
-# runs the pure-ggml path on the Vulkan or CUDA device. SAM3_COREML is NOT defined,
-# no .mm, no frameworks.
+# calls are #ifdef SAM3_COREML-guarded, so here the tracker runs the pure-ggml
+# path on the Vulkan or CUDA device (with the opt-in ggml encoder-ahead producer
+# on CUDA). SAM3_COREML is NOT defined, no .mm, no frameworks.
+#
+# SAM3_CAPI_SHARED: build the C-ABI as its own SHARED library (sam3capi.dll /
+# libsam3capi.so) instead of folding it into the static libsam3. This is the
+# Windows/CUDA cgo boundary: nvcc requires MSVC as its host compiler on Windows,
+# and an MSVC-built C++ static lib cannot link into a mingw cgo binary (C++ ABI /
+# runtime mismatch). A C-ABI DLL is toolchain-neutral — all C++ (sam3 + ggml +
+# ggml-cuda + ggml-vulkan) stays inside the MSVC-built DLL and Go links only the
+# 15 extern "C" entry points. Keep BUILD_SHARED_LIBS=OFF with this so ggml links
+# statically INTO the DLL (one artifact + the CUDA runtime DLLs).
+option(SAM3_CAPI_SHARED "Build the cgo C-ABI tracker as a shared library (Windows/MSVC cgo boundary)" OFF)
 if(NOT APPLE AND (SAM3_VULKAN OR SAM3_CUDA))
-    target_sources(sam3 PRIVATE coreml/edgetam_capi.cpp)
-    target_include_directories(sam3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/coreml)
+    if(SAM3_CAPI_SHARED)
+        add_library(sam3capi SHARED coreml/edgetam_capi.cpp)
+        target_include_directories(sam3capi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/coreml)
+        # ET_CAPI_BUILD_DLL turns on __declspec(dllexport) for the capi entry
+        # points (see ET_API in edgetam_capi.h) — extern "C" alone does not
+        # export symbols from an MSVC DLL.
+        target_compile_definitions(sam3capi PRIVATE ET_CAPI_BUILD_DLL)
+        target_link_libraries(sam3capi PRIVATE sam3)
+    else()
+        target_sources(sam3 PRIVATE coreml/edgetam_capi.cpp)
+        target_include_directories(sam3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/coreml)
+    endif()
 endif()
 
 # Examples (only when top-level)
