@@ -20,12 +20,18 @@ struct EtTracker {
     sam3_tracker_ptr            tracker;
 
     // RFD 0011 U8 Wave 5 (encoder-ahead threading): a producer encoder handle
-    // (its OWN MLModel, per-thread ownership) + a fixed neck pool. Go owns slot
-    // free/ready coordination via channels, so NO lock here — each slot is written
-    // once by encode_slot (producer thread) then read once by track_slot (consumer
-    // thread). track_slot is the ONLY caller of sam3_coreml_set_prefetched_neck
-    // (global, consumer-thread-only). prod_enc is non-null only when CoreML is on.
+    // (its OWN engine instance, per-thread ownership) + a fixed neck pool. Go owns
+    // slot free/ready coordination via channels, so NO lock here — each slot is
+    // written once by encode_slot (producer thread) then read once by track_slot
+    // (consumer thread). track_slot is the ONLY caller of
+    // sam3_coreml_set_prefetched_neck (global, consumer-thread-only).
+    // At most ONE producer engine is ever non-null:
+    //   prod_enc — CoreML MLModel (SAM3_COREML builds)
+    //   ggml_ea  — second ggml-CUDA backend instance (non-CoreML builds, opt-in
+    //              via SAM3_GGML_ENCODER_AHEAD=1; the CoreML-threading
+    //              equivalent for NVIDIA)
     edgetam_coreml_handle prod_enc = nullptr;
+    sam3_encoder_ahead*   ggml_ea  = nullptr;
     static const int      POOL = 3;
     std::vector<float>    neck[POOL][3];   // n0 256*256*256, n1 128*128*256, n2 64*64*256
 
@@ -89,17 +95,33 @@ extern "C" edgetam_tracker_t edgetam_capi_create(const char* models_dir,
         t->tracker = sam3_create_visual_tracker(*t->model, vp);
 #ifdef SAM3_COREML
         // Wave 5: producer encoder handle + neck pool (CoreML encoder-ahead threading).
-        // Absent on non-CoreML builds → prod_enc stays null → pool_size()==0 →
-        // the cgo session uses the synchronous (single-thread) Track path.
         if (models_dir && *models_dir) {
             std::string d = models_dir;
             t->prod_enc = edgetam_coreml_create((d + "/edgetam_encoder_neck_nhwc.mlpackage").c_str(), /*ANE*/ 1);
+        }
+#else
+        // RFD 0011 (CUDA): ggml encoder-ahead producer — the CoreML-threading
+        // equivalent for NVIDIA. A second ggml-CUDA backend instance encodes
+        // frame N+1 on its own stream while the consumer propagates frame N.
+        // OPT-IN (SAM3_GGML_ENCODER_AHEAD=1) and default OFF: same-GPU
+        // producer/consumer contention is hardware-dependent (the M4 sweep
+        // showed co-location can LOSE) — A/B on the target GPU first.
+        // sam3_encoder_ahead_create itself returns NULL unless the active
+        // backend is CUDA and the model is EdgeTAM, so a Vulkan/CPU fallback
+        // run cleanly keeps pool_size()==0 → the synchronous Track path.
+        const char* ea_env = getenv("SAM3_GGML_ENCODER_AHEAD");
+        if (ea_env && *ea_env && strcmp(ea_env, "0") != 0) {
+            t->ggml_ea = sam3_encoder_ahead_create(*t->model);
+        }
+#endif
+        // Either producer engine present → allocate the fixed neck pool; neither
+        // → pool_size()==0 → the cgo session uses the synchronous Track path.
+        if (t->prod_enc || t->ggml_ea) {
             const int Wd[3] = {256, 128, 64};
             for (int s = 0; s < EtTracker::POOL; ++s)
                 for (int i = 0; i < 3; ++i)
                     t->neck[s][i].assign((size_t)256 * Wd[i] * Wd[i], 0.f);
         }
-#endif
         return t.release();
     } catch (...) {
         return nullptr;
@@ -174,6 +196,7 @@ extern "C" void edgetam_capi_destroy(edgetam_tracker_t h) {
 #ifdef SAM3_COREML
     if (t && t->prod_enc) edgetam_coreml_destroy(t->prod_enc);
 #endif
+    if (t && t->ggml_ea) sam3_encoder_ahead_destroy(t->ggml_ea);
     delete t;
 }
 
@@ -186,28 +209,33 @@ extern "C" void edgetam_capi_destroy(edgetam_tracker_t h) {
 
 extern "C" int edgetam_capi_pool_size(edgetam_tracker_t h) {
     auto* t = static_cast<EtTracker*>(h);
-    return (t && t->prod_enc) ? EtTracker::POOL : 0;   // 0 => threading unavailable
+    return (t && (t->prod_enc || t->ggml_ea)) ? EtTracker::POOL : 0;  // 0 => threading unavailable
 }
 
 extern "C" int edgetam_capi_encode_slot(edgetam_tracker_t h, int slot,
                                         const uint8_t* rgb, int w, int hgt) {
     auto* t = static_cast<EtTracker*>(h);
-    if (!t || !t->prod_enc || !rgb || slot < 0 || slot >= EtTracker::POOL) return 0;
-#ifdef SAM3_COREML
+    if (!t || (!t->prod_enc && !t->ggml_ea) || !rgb || slot < 0 || slot >= EtTracker::POOL) return 0;
     try {
+#ifdef SAM3_COREML
         sam3_image img = make_image(rgb, w, hgt);
         std::vector<float> norm = sam3_coreml_preprocess_image(img, 1024);
         return edgetam_coreml_encode(t->prod_enc, norm.data(),
                                      t->neck[slot][0].data(),
                                      t->neck[slot][1].data(),
                                      t->neck[slot][2].data()) ? 1 : 0;
+#else
+        // ggml encoder-ahead (CUDA): preprocess + encode on the producer's own
+        // backend instance; write the 3 neck levels into this slot's buffers.
+        sam3_image img = make_image(rgb, w, hgt);
+        return sam3_encoder_ahead_encode(t->ggml_ea, *t->model, img,
+                                         t->neck[slot][0].data(),
+                                         t->neck[slot][1].data(),
+                                         t->neck[slot][2].data()) ? 1 : 0;
+#endif
     } catch (...) {
         return 0;
     }
-#else
-    (void)rgb; (void)w; (void)hgt;  // encoder-ahead threading is CoreML-only
-    return 0;
-#endif
 }
 
 extern "C" et_result edgetam_capi_track_slot(edgetam_tracker_t h, int slot,
@@ -217,13 +245,15 @@ extern "C" et_result edgetam_capi_track_slot(edgetam_tracker_t h, int slot,
     auto* t = static_cast<EtTracker*>(h);
     if (!t || !rgb || slot < 0 || slot >= EtTracker::POOL) return r;
     try {
-#ifdef SAM3_COREML
         // Consumer thread only: hand the producer-encoded neck to the library so
-        // sam3_propagate_frame's encode step is skipped (no ggml/CoreML encode here).
-        sam3_coreml_set_prefetched_neck(t->neck[slot][0].data(),
-                                        t->neck[slot][1].data(),
-                                        t->neck[slot][2].data());
-#endif
+        // sam3_propagate_frame's encode step is skipped (no in-line encode here).
+        // The seam is backend-agnostic — the slot was filled by the CoreML
+        // producer OR the ggml-CUDA encoder-ahead producer.
+        if (t->prod_enc || t->ggml_ea) {
+            sam3_coreml_set_prefetched_neck(t->neck[slot][0].data(),
+                                            t->neck[slot][1].data(),
+                                            t->neck[slot][2].data());
+        }
         sam3_image img = make_image(rgb, w, hgt);
         sam3_result res = sam3_propagate_frame(*t->tracker, *t->state, *t->model, img);
         if (res.detections.empty()) { t->last_mask = sam3_mask{}; return r; }

@@ -3441,21 +3441,44 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
 #ifdef GGML_USE_CUDA
     // NVIDIA fast-path. ggml-CUDA runs the EdgeTAM graph with tensor-core FP16
     // kernels, CUDA graphs, and FlashAttention. Preferred over Vulkan when both are
-    // compiled in (a fat NVIDIA build). device 0 = first CUDA GPU. Returns NULL if
-    // there is no CUDA device/driver (or a CUDA 12/13 lib mismatch) — the chain then
-    // falls through to Vulkan, then CPU. We log the selection so a silent CPU
-    // fallback is visible (cf. Egor part-2: "always check which provider ran").
+    // compiled in (a fat NVIDIA build). device 0 = first CUDA GPU. The device-count
+    // guard + log-AFTER-init make the runtime fallback chain (CUDA → Vulkan → CPU)
+    // observable and honest: a machine without an NVIDIA device/driver (or with a
+    // CUDA 12/13 lib mismatch) logs the fallback instead of claiming CUDA ran
+    // (cf. Egor part-2: "always check which provider ran").
     if (params.use_gpu && !model->backend) {
-        fprintf(stderr, "%s: using CUDA backend\n", __func__);
-        model->backend = ggml_backend_cuda_init(0);
+        if (ggml_backend_cuda_get_device_count() > 0) {
+            model->backend = ggml_backend_cuda_init(0);
+        }
+        if (model->backend) {
+            fprintf(stderr, "%s: using CUDA backend (%s)\n", __func__, ggml_backend_name(model->backend));
+        } else {
+            fprintf(stderr, "%s: CUDA backend unavailable (no NVIDIA device/driver) — falling back\n", __func__);
+        }
     }
 #endif
 #ifdef GGML_USE_VULKAN
     // RFD 0011: cross-vendor GPU. ggml-Vulkan runs the same EdgeTAM graph on any
     // Vulkan device (AMD/NVIDIA/Intel; Apple via MoltenVK). device 0 = first GPU.
+    // ggml-Vulkan THROWS (vk::SystemError) when the Vulkan loader/driver is absent
+    // or pre-1.2 — both the device-count probe and init are wrapped so a GPU-less
+    // machine falls through to the CPU backend instead of failing the model load.
     if (params.use_gpu && !model->backend) {
-        fprintf(stderr, "%s: using Vulkan backend\n", __func__);
-        model->backend = ggml_backend_vk_init(0);
+        try {
+            if (ggml_backend_vk_get_device_count() > 0) {
+                model->backend = ggml_backend_vk_init(0);
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr, "%s: Vulkan probe failed (%s)\n", __func__, e.what());
+            model->backend = nullptr;
+        } catch (...) {
+            model->backend = nullptr;
+        }
+        if (model->backend) {
+            fprintf(stderr, "%s: using Vulkan backend (%s)\n", __func__, ggml_backend_name(model->backend));
+        } else {
+            fprintf(stderr, "%s: Vulkan backend unavailable (no Vulkan device/driver) — falling back\n", __func__);
+        }
     }
 #endif
     if (!model->backend) {
@@ -5012,29 +5035,21 @@ static void edgetam_build_repvit_graph(struct ggml_context* ctx,
     }
 }
 
-#ifdef SAM3_COREML
-#include "edgetam_coreml.h"
-
-// RFD 0011 U8 (threaded encoder-ahead): the producer thread runs preprocess +
-// CoreML encode for frame N+1 into s_prefetch_neck while the main thread runs the
-// consumer (assembly+memattn+decode+memencode+bank) for frame N. When a prefetched
-// neck is ready, the main thread's encode step copies it (skipping BOTH preprocess
-// and the CoreML encode), so the ~17 ms encoder leg overlaps the ~52 ms consumer.
-// SPSC: the bench serializes set→consume per frame, so no lock is needed here.
+// ── RFD 0011: prefetched-neck seam (backend-agnostic) ────────────────────────
+// Threaded encoder-ahead: a PRODUCER thread runs preprocess + encode for frame
+// N+1 into s_prefetch_neck while the main thread runs the consumer
+// (assembly+memattn+decode+memencode+bank) for frame N. When a prefetched neck
+// is ready, the main thread's encode step copies it (skipping BOTH preprocess
+// and the encode), so the encoder leg overlaps the consumer. The producer engine
+// is CoreML on Apple (edgetam_coreml_encode) and a SECOND ggml backend instance
+// on CUDA (sam3_encoder_ahead_encode) — the seam itself is raw float arrays with
+// no backend dependency. Function names keep the historic sam3_coreml_ prefix
+// for source compatibility with the existing capi + threaded benches.
+// SPSC: the consumer thread is the only reader AND the only caller of
+// sam3_coreml_set_prefetched_neck (per the capi contract), so no lock is needed.
+// Fixed EdgeTAM@1024 contract: levels 256/128/64 x 256ch.
 static std::vector<float> s_prefetch_neck[3];
 static bool s_prefetch_ready = false;
-
-// RFD 0011 U8 — per-chip CoreML compute-unit profile (0=ALL 1=ANE 2=GPU 3=CPU).
-// M4 Pro sweep (sam3_coreml_pipeline, isolated 20-rep median): encoder ANE 11ms
-// (GPU 14, CPU 38), mem-attn GPU 17ms (ANE 26, CPU 24), decoder ANE 7.8ms (GPU 8.2),
-// memenc ANE 5.0 / GPU 3.9. Defaults = the validated M4 optimum (enc ANE, mem-attn
-// GPU, decoder ANE, memenc ANE — memenc's isolated GPU edge washes out in thermal
-// noise end-to-end). NOT inverted vs M1 like the ORT/EfficientTAM stack. Override
-// per chip via env (e.g. SAM3_COREML_MA_UNIT=1) if M1/M2/M3 profiles differ.
-static int sam3_coreml_unit(const char* env, int def) {
-    const char* v = getenv(env);
-    return (v && *v) ? atoi(v) : def;
-}
 
 void sam3_coreml_set_prefetched_neck(const float* n0, const float* n1, const float* n2) {
     const int Wd[3] = {256, 128, 64}, D = 256;
@@ -5046,6 +5061,69 @@ void sam3_coreml_set_prefetched_neck(const float* n0, const float* n1, const flo
 // Exposed for the producer thread (preprocess off the main thread).
 std::vector<float> sam3_coreml_preprocess_image(const sam3_image& image, int img_size) {
     return sam2_preprocess_image(image, img_size);
+}
+
+// Load 3 neck levels (contiguous [D,W,H] floats, EdgeTAM@1024: 256/128/64 x 256ch)
+// into the persistent state tensors, (re)allocating state + the sinusoidal PE on
+// the first frame after create/reset. Factored from the CoreML encode helper so
+// the ggml prefetch-consume path (encoder-ahead on CUDA) loads necks identically.
+// Per rule reference-rules-in-comments: think-in-systems — one load path, two
+// producers (CoreML / second ggml backend).
+static bool edgetam_load_neck_from_floats(sam3_state& state, const sam3_model& model,
+                                          std::vector<float> nbuf[3]) {
+    const int D = model.hparams.neck_dim;      // 256
+    const int Wd[3] = {256, 128, 64};
+    const int Hd[3] = {256, 128, 64};
+    SAM3_TIME_SCOPE(state_update_ms);
+    bool reuse = state.buffer && state.pe_buf && state.neck_trk[0]
+              && state.neck_trk[0]->ne[0] == D && state.neck_trk[0]->ne[1] == Wd[0];
+    if (!reuse) {
+        if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+        if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+        if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+        if (state.ctx)    { ggml_free(state.ctx);    state.ctx = nullptr; }
+        struct ggml_init_params sp = {ggml_tensor_overhead() * 32, nullptr, true};
+        state.ctx = ggml_init(sp);
+        for (int i = 0; i < 3; ++i) {
+            state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
+            char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_%d", i); ggml_set_name(state.neck_trk[i], nm);
+        }
+        state.neck_trk[3] = nullptr;
+        state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+        // Positional encoding (same as the ggml path: sinusoidal_pe_2d(H, W, D)).
+        struct ggml_init_params pp = {ggml_tensor_overhead() * 16, nullptr, true};
+        state.pe_ctx = ggml_init(pp);
+        for (int i = 0; i < 3; ++i) {
+            state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
+            char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_pe_%d", i); ggml_set_name(state.neck_trk_pe[i], nm);
+        }
+        state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+        for (int i = 0; i < 3; ++i) {
+            auto pe = sam3_sinusoidal_pe_2d(Hd[i], Wd[i], D);
+            ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+        }
+    }
+    // Contiguous [D,W,H] floats load with a DIRECT copy — no per-frame transpose
+    // (CoreML exports channels-last [1,H,W,D] whose bytes are identical; a ggml
+    // producer's ggml_backend_tensor_get output is already in this layout).
+    for (int i = 0; i < 3; ++i)
+        ggml_backend_tensor_set(state.neck_trk[i], nbuf[i].data(), 0, nbuf[i].size() * sizeof(float));
+    return true;
+}
+
+#ifdef SAM3_COREML
+#include "edgetam_coreml.h"
+
+// RFD 0011 U8 — per-chip CoreML compute-unit profile (0=ALL 1=ANE 2=GPU 3=CPU).
+// M4 Pro sweep (sam3_coreml_pipeline, isolated 20-rep median): encoder ANE 11ms
+// (GPU 14, CPU 38), mem-attn GPU 17ms (ANE 26, CPU 24), decoder ANE 7.8ms (GPU 8.2),
+// memenc ANE 5.0 / GPU 3.9. Defaults = the validated M4 optimum (enc ANE, mem-attn
+// GPU, decoder ANE, memenc ANE — memenc's isolated GPU edge washes out in thermal
+// noise end-to-end). NOT inverted vs M1 like the ORT/EfficientTAM stack. Override
+// per chip via env (e.g. SAM3_COREML_MA_UNIT=1) if M1/M2/M3 profiles differ.
+static int sam3_coreml_unit(const char* env, int def) {
+    const char* v = getenv(env);
+    return (v && *v) ? atoi(v) : def;
 }
 
 // RFD 0011 (CoreML/ANE hybrid): run the EdgeTAM encoder on CoreML/ANE (~12 ms)
@@ -5087,45 +5165,10 @@ static bool edgetam_encode_image_coreml(sam3_state& state, const sam3_model& mod
             return false;
     }
 
-    // Build/refresh the persistent state (U1 reuse) and permute CoreML's
-    // [D,H,W] (NCHW, W innermost) into ggml neck_trk [D,W,H] (D innermost).
-    {
-        SAM3_TIME_SCOPE(state_update_ms);
-        bool reuse = state.buffer && state.pe_buf && state.neck_trk[0]
-                  && state.neck_trk[0]->ne[0] == D && state.neck_trk[0]->ne[1] == Wd[0];
-        if (!reuse) {
-            if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
-            if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
-            if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
-            if (state.ctx)    { ggml_free(state.ctx);    state.ctx = nullptr; }
-            struct ggml_init_params sp = {ggml_tensor_overhead() * 32, nullptr, true};
-            state.ctx = ggml_init(sp);
-            for (int i = 0; i < 3; ++i) {
-                state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
-                char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_%d", i); ggml_set_name(state.neck_trk[i], nm);
-            }
-            state.neck_trk[3] = nullptr;
-            state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
-            // Positional encoding (same as the ggml path: sinusoidal_pe_2d(H, W, D)).
-            struct ggml_init_params pp = {ggml_tensor_overhead() * 16, nullptr, true};
-            state.pe_ctx = ggml_init(pp);
-            for (int i = 0; i < 3; ++i) {
-                state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
-                char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_pe_%d", i); ggml_set_name(state.neck_trk_pe[i], nm);
-            }
-            state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
-            for (int i = 0; i < 3; ++i) {
-                auto pe = sam3_sinusoidal_pe_2d(Hd[i], Wd[i], D);
-                ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
-            }
-        }
-        // The CoreML model exports channels-last [1,H,W,D], whose contiguous
-        // bytes are byte-identical to ggml neck_trk [D,W,H] (d innermost, then W,
-        // then H). So each level loads with a DIRECT copy — no per-frame transpose.
-        for (int i = 0; i < 3; ++i)
-            ggml_backend_tensor_set(state.neck_trk[i], nbuf[i].data(), 0, nbuf[i].size() * sizeof(float));
-    }
-    return true;
+    // Build/refresh the persistent state (U1 reuse) and load CoreML's channels-
+    // last [1,H,W,D] output — byte-identical to ggml neck_trk [D,W,H] — via the
+    // shared (backend-agnostic) neck loader.
+    return edgetam_load_neck_from_floats(state, model, nbuf);
 }
 #endif  // SAM3_COREML
 
@@ -5157,6 +5200,18 @@ static bool edgetam_encode_image(sam3_state& state,
         return edgetam_encode_image_coreml(state, model, image, cml_img);
     }
 #endif
+
+    // RFD 0011 (ggml encoder-ahead): a producer thread (sam3_encoder_ahead_encode,
+    // a SECOND ggml backend instance — own CUDA stream) already encoded THIS
+    // frame's neck into the prefetch seam. Load it into state and skip the whole
+    // in-line encoder graph, mirroring the CoreML prefetch path above. Guarded to
+    // the seam's fixed EdgeTAM@1024 contract (levels 256/128/64).
+    if (s_prefetch_ready && hp.is_edgetam() && img_size == 1024) {
+        static std::vector<float> nbuf[3];  // consumer-thread-only (SPSC seam)
+        for (int i = 0; i < 3; ++i) nbuf[i].swap(s_prefetch_neck[i]);
+        s_prefetch_ready = false;
+        return edgetam_load_neck_from_floats(state, model, nbuf);
+    }
 
     // ── Preprocess (same ImageNet normalization as SAM2) ─────────────────
     // RFD 0011 U0: preprocess timed separately from the graph build/alloc/compute.
@@ -5360,6 +5415,105 @@ static bool edgetam_encode_image(sam3_state& state,
     }
 
     return true;
+}
+
+/*****************************************************************************
+** RFD 0011 — ggml encoder-ahead producer (CUDA)
+**
+** The NVIDIA counterpart of the CoreML producer-encoder pool: a SECOND ggml
+** backend instance on the same CUDA device gives the producer thread its own
+** stream + cublas handles, so the frame-N+1 encoder graph overlaps the
+** frame-N consumer (mem-attn/decoder/mem-enc) on the GPU's own scheduler.
+** The weight tensors stay shared (same-device memory, read-only after load).
+**
+** CUDA-only for now: cross-instance buffer reads are unverified on Vulkan,
+** and the M4 compute-unit sweep showed same-accelerator producer/consumer
+** co-location can LOSE (the Mac win came from ANE parallel to GPU) — so this
+** must be A/B-measured on real NVIDIA hardware (the platform encoder-ahead
+** bench) before it can default on. Callers opt in via the capi
+** (SAM3_GGML_ENCODER_AHEAD=1).
+*****************************************************************************/
+
+struct sam3_encoder_ahead {
+    ggml_backend_t backend = nullptr;  // producer-owned second backend instance
+    ggml_gallocr_t galloc  = nullptr;  // producer-owned graph allocator
+};
+
+sam3_encoder_ahead* sam3_encoder_ahead_create(const sam3_model& model) {
+#ifdef GGML_USE_CUDA
+    // A ggml_backend_t is not safe for concurrent graph_compute from two
+    // threads, so the producer gets its own CUDA context (own stream). Weights
+    // live in device memory on the same GPU and are read-only after load, so
+    // both instances can read them. Only offered when the consumer actually
+    // runs on CUDA (a CPU/Vulkan consumer cannot read another instance's
+    // buffers safely) and the model is EdgeTAM (the seam's fixed contract).
+    if (!model.backend || !ggml_backend_is_cuda(model.backend)) return nullptr;
+    if (!model.hparams.is_edgetam()) return nullptr;
+    ggml_backend_t b = ggml_backend_cuda_init(0);
+    if (!b) return nullptr;
+    auto* ea = new sam3_encoder_ahead();
+    ea->backend = b;
+    ea->galloc  = ggml_gallocr_new(ggml_backend_get_default_buffer_type(b));
+    if (!ea->galloc) { ggml_backend_free(b); delete ea; return nullptr; }
+    fprintf(stderr, "%s: ggml encoder-ahead producer on %s\n", __func__, ggml_backend_name(b));
+    return ea;
+#else
+    (void)model;  // producer pool unavailable on non-CUDA ggml builds
+    return nullptr;
+#endif
+}
+
+// Preprocess + run the EdgeTAM RepViT+FPN encoder graph on the PRODUCER backend
+// and extract the 3 neck levels as contiguous [D,W,H] floats (the prefetch-seam
+// layout). n0/n1/n2 must hold 256*256*256, 256*128*128, 256*64*64 floats.
+bool sam3_encoder_ahead_encode(sam3_encoder_ahead* ea, const sam3_model& model,
+                               const sam3_image& image,
+                               float* n0, float* n1, float* n2) {
+    if (!ea || !ea->backend || !n0 || !n1 || !n2) return false;
+    const int img_size = 1024;  // the prefetch seam's fixed EdgeTAM contract
+
+    std::vector<float> img_data = sam2_preprocess_image(image, img_size);
+
+    // Build the same encoder graph edgetam_encode_image builds (build cost is
+    // ~0.3 ms per U0; the gallocr reuses its reservation across frames).
+    const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+    struct ggml_init_params gparams = {buf_size, nullptr, true};
+    struct ggml_context* ctx0 = ggml_init(gparams);
+    if (!ctx0) return false;
+
+    struct ggml_tensor* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
+    ggml_set_name(inp, "input_image");
+    ggml_set_input(inp);
+
+    struct ggml_tensor* stage_outs[4] = {};
+    edgetam_build_repvit_graph(ctx0, inp, model, stage_outs);
+    struct ggml_tensor* fpn_outs[4] = {};
+    edgetam_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
+    for (int i = 0; i < 3; ++i) ggml_set_output(fpn_outs[i]);
+
+    struct ggml_cgraph* graph = ggml_new_graph_custom(ctx0, 32768, false);
+    for (int i = 0; i < 3; ++i) ggml_build_forward_expand(graph, fpn_outs[i]);
+
+    bool ok = ggml_gallocr_alloc_graph(ea->galloc, graph);
+    if (ok) {
+        ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+        // n_threads only applies to a CPU backend; the producer is CUDA here.
+        ok = sam3_graph_compute(ea->backend, graph, 4);
+    }
+    if (ok) {
+        float* dst[3] = {n0, n1, n2};
+        for (int i = 0; i < 3; ++i)
+            ggml_backend_tensor_get(fpn_outs[i], dst[i], 0, ggml_nbytes(fpn_outs[i]));
+    }
+    ggml_free(ctx0);
+    return ok;
+}
+
+void sam3_encoder_ahead_destroy(sam3_encoder_ahead* ea) {
+    if (!ea) return;
+    if (ea->galloc)  ggml_gallocr_free(ea->galloc);
+    if (ea->backend) ggml_backend_free(ea->backend);
+    delete ea;
 }
 
 /*****************************************************************************

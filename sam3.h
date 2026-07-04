@@ -365,16 +365,38 @@ sam3_image      sam3_decode_video_frame(const std::string & video_path, int fram
 sam3_video_info sam3_get_video_info(const std::string & video_path);
 
 /*
-** ── RFD 0011 U8: threaded encoder-ahead (CoreML) ─────────────────────────
-** The producer thread preprocesses + CoreML-encodes frame N+1 off the main
-** thread, then hands the 3 neck levels here; the next sam3_propagate_frame's
-** encode step consumes them (skipping preprocess + encode) so the encoder leg
-** overlaps the consumer. Built only with SAM3_COREML; no-ops otherwise.
+** ── RFD 0011 U8: threaded encoder-ahead (backend-agnostic seam) ──────────
+** The producer thread preprocesses + encodes frame N+1 off the main thread,
+** then hands the 3 neck levels here; the next sam3_propagate_frame's encode
+** step consumes them (skipping preprocess + encode) so the encoder leg
+** overlaps the consumer. The producer engine is CoreML on Apple or a second
+** ggml-CUDA backend instance on NVIDIA (sam3_encoder_ahead_* below); the
+** seam itself is raw floats — available on every build. Names keep the
+** historic sam3_coreml_ prefix for source compatibility.
 */
 void              sam3_coreml_set_prefetched_neck(const float* neck0,
                                                   const float* neck1,
                                                   const float* neck2);
 std::vector<float> sam3_coreml_preprocess_image(const sam3_image& image, int img_size);
+
+/*
+** ── RFD 0011: ggml encoder-ahead producer (CUDA) ─────────────────────────
+** NVIDIA counterpart of the CoreML producer encoder: a SECOND ggml backend
+** instance (own CUDA stream) runs the EdgeTAM encoder graph for frame N+1
+** concurrently with the consumer's mem-attn/decoder work for frame N.
+** create returns NULL unless the model's active backend is CUDA and the
+** model is EdgeTAM. encode writes the 3 neck levels in the prefetch-seam
+** layout ([D,W,H] contiguous floats; 256*256*256 / 256*128*128 / 256*64*64).
+** Same-GPU producer/consumer contention is hardware-dependent — A/B on the
+** target GPU before defaulting on (the capi gates this behind
+** SAM3_GGML_ENCODER_AHEAD=1).
+*/
+struct sam3_encoder_ahead;
+sam3_encoder_ahead* sam3_encoder_ahead_create(const sam3_model& model);
+bool                sam3_encoder_ahead_encode(sam3_encoder_ahead* ea, const sam3_model& model,
+                                              const sam3_image& image,
+                                              float* neck0, float* neck1, float* neck2);
+void                sam3_encoder_ahead_destroy(sam3_encoder_ahead* ea);
 
 /*****************************************************************************
 ** Test and Debug API
