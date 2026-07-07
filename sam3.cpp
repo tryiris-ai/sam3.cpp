@@ -992,6 +992,66 @@ static void sam3_stage_feed(const sam3_transport& tr, struct ggml_tensor* src,
     ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
 }
 
+// Residency handle for values that today live in host vectors (increment 2).
+// The EXISTING host vector remains the value and keeps its name/type/owner;
+// the stagebuf only ADDS a persistent device twin beside it. HOST mode never
+// touches the twin — the push is verbatim today's ggml_backend_tensor_set.
+// DEVICE mode uploads the host value into the twin only when its content
+// generation changes (constants: once), then D2D-copies twin -> fresh input.
+struct sam3_stagebuf {
+    struct ggml_context*  ctx = nullptr;  // owns dev's metadata (no_alloc)
+    struct ggml_tensor*   dev = nullptr;  // persistent device twin
+    ggml_backend_buffer_t buf = nullptr;  // owns dev's storage
+    size_t   nbytes = 0;
+    uint64_t gen    = (uint64_t)-1;       // content generation last uploaded
+};
+
+static void sam3_stagebuf_release(sam3_stagebuf& sb) {
+    if (sb.buf) ggml_backend_buffer_free(sb.buf);
+    if (sb.ctx) ggml_free(sb.ctx);
+    sb.ctx = nullptr; sb.dev = nullptr; sb.buf = nullptr;
+    sb.nbytes = 0; sb.gen = (uint64_t)-1;
+}
+
+// Feed a graph-input leaf from a host-side value. `gen` keys the twin's
+// content: pass a counter that increments whenever the host value is
+// recomputed (PE-cache generations); size changes (e.g. rope_k during the
+// memory-bank ramp) re-shape the twin automatically.
+static void sam3_stagebuf_push(const sam3_transport& tr, sam3_stagebuf& sb,
+                               const void* host, size_t nbytes,
+                               struct ggml_tensor* dst, uint64_t gen, const char* site) {
+    if (tr.kind != SAM3_TRANSPORT_DEVICE) {
+        ggml_backend_tensor_set(dst, host, 0, nbytes);  // verbatim host path
+        return;
+    }
+    GGML_ASSERT(nbytes == ggml_nbytes(dst));
+    if (sb.dev && (sb.nbytes != nbytes || !sam3_same_layout(sb.dev, dst)))
+        sam3_stagebuf_release(sb);
+    if (!sb.dev) {
+        struct ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
+        sb.ctx = ggml_init(ip);
+        sb.dev = sb.ctx ? ggml_dup_tensor(sb.ctx, dst) : nullptr;
+        sb.buf = sb.dev ? ggml_backend_alloc_ctx_tensors(sb.ctx, tr.backend) : nullptr;
+        if (!sb.buf || ggml_backend_buffer_is_host(sb.dev->buffer)) {
+            static std::map<std::string, bool> warned;
+            if (!warned[site]) {
+                warned[site] = true;
+                fprintf(stderr, "sam3_stagebuf_push: %s: twin alloc failed — using host path\n", site);
+            }
+            sam3_stagebuf_release(sb);
+            ggml_backend_tensor_set(dst, host, 0, nbytes);
+            return;
+        }
+        sb.nbytes = nbytes;
+        sb.gen    = (uint64_t)-1;
+    }
+    if (sb.gen != gen) {
+        ggml_backend_tensor_set(sb.dev, host, 0, nbytes);  // one upload per content change
+        sb.gen = gen;
+    }
+    ggml_backend_tensor_copy(sb.dev, dst);  // same-backend D2D
+}
+
 // Resolved once at model load, after the backend chain (Metal>CUDA>Vulkan>CPU).
 // Default host on every backend; device only when explicitly requested AND the
 // answered backend is CUDA — Metal can never pass this gate, so the mac cannot
@@ -1072,6 +1132,19 @@ struct sam3_model {
     // stage-transport driver (host default everywhere; CUDA device opt-in)
     sam3_transport          transport;
 
+    // Device-transport weight caches (increment 2): host copies of the small
+    // immutable weights that per-frame CPU logic re-reads from the device
+    // every frame (obj-ptr MLP + no_obj_ptr, perceiver latents, maskmem tpos).
+    // Populated ONCE at load and ONLY when transport == device; empty on the
+    // host driver, so every per-frame read stays verbatim today's sequence.
+    // Each cache replicates its consuming site's exact read (sam3_read_f32
+    // for converted weights, raw tensor_get for no_obj_ptr).
+    struct {
+        std::vector<float> objptr_w[3], objptr_b[3], no_obj_ptr;
+        std::vector<float> perc_latents_1d, perc_latents_2d;
+        std::vector<float> tpos;
+    } wcache;
+
     // tensor lookup
     std::map<std::string, struct ggml_tensor*> tensors;
 
@@ -1111,6 +1184,12 @@ struct sam3_state {
     float no_mask_emb_cache[256]    = {};
     std::vector<float> dense_pe_cache;      // [D * H * H] -- PE grid
     std::vector<float> dense_nomask_cache;  // [D * H * H] -- no-mask tiled
+
+    // Stage-transport device twins for the PE-cache constants (increment 2).
+    // Inert on the host driver; content keyed on pe_cache_gen (bumped whenever
+    // sam3_populate_pe_cache actually recomputes). Freed in sam3_free_state.
+    uint64_t     pe_cache_gen = 0;
+    sam3_stagebuf tw_sparse, tw_image_pe, tw_dense;
 };
 
 /*
@@ -1221,6 +1300,14 @@ struct sam3_tracker {
 
     // EdgeTAM-specific: RoPE for 16x16 grid (cross-attn K on perceiver 2D latents)
     std::vector<float> cached_axial_cis_k16_reord; // [2, 128, 256] for 16x16 grid
+
+    // Stage-transport device twins for the propagate constants (increment 2).
+    // Inert on the host driver; content keyed on pe_gen (bumped whenever
+    // sam3_ensure_tracker_pe_caches recomputes). rope_k's content is a pure
+    // function of (k16 cache, M_spatial) — the twin auto-reshapes on size
+    // change, so pe_gen keys it too. Freed with owned_buffers on reset.
+    uint64_t     pe_gen = 0;
+    sam3_stagebuf tw_rope_q, tw_rope_k, tw_src_pos;
 };
 
 // Resolve effective img_size / feat_size from state (which may override hp defaults).
@@ -3627,6 +3714,41 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         fprintf(stderr, "%s: visual-only model — skipping tokenizer\n", __func__);
     }
 
+    // Device-transport weight caches (increment 2): read each small immutable
+    // weight ONCE now instead of every frame. Device driver only — on the
+    // host driver the caches stay empty and the per-frame reads are verbatim.
+    if (model->transport.kind == SAM3_TRANSPORT_DEVICE) {
+        const int D  = model->hparams.neck_dim;
+        const int MD = model->hparams.mem_out_dim;
+        for (int j = 0; j < 3; ++j) {
+            if (model->obj_ptr_proj_w[j] && model->obj_ptr_proj_b[j]) {
+                const int nel_w = (int)(model->obj_ptr_proj_w[j]->ne[0] * model->obj_ptr_proj_w[j]->ne[1]);
+                model->wcache.objptr_w[j].resize(nel_w);
+                sam3_read_f32(model->obj_ptr_proj_w[j], model->wcache.objptr_w[j].data(), nel_w);
+                model->wcache.objptr_b[j].resize(D);
+                sam3_read_f32(model->obj_ptr_proj_b[j], model->wcache.objptr_b[j].data(), D);
+            }
+        }
+        if (model->no_obj_ptr) {
+            model->wcache.no_obj_ptr.resize(D);
+            ggml_backend_tensor_get(model->no_obj_ptr, model->wcache.no_obj_ptr.data(), 0, D * sizeof(float));
+        }
+        if (model->hparams.has_perceiver && model->perceiver.latents_1d && model->perceiver.latents_2d) {
+            const int n1 = (int)(model->perceiver.latents_1d->ne[0] * model->perceiver.latents_1d->ne[1]);
+            const int n2 = (int)(model->perceiver.latents_2d->ne[0] * model->perceiver.latents_2d->ne[1]);
+            model->wcache.perc_latents_1d.resize(n1);
+            sam3_read_f32(model->perceiver.latents_1d, model->wcache.perc_latents_1d.data(), n1);
+            model->wcache.perc_latents_2d.resize(n2);
+            sam3_read_f32(model->perceiver.latents_2d, model->wcache.perc_latents_2d.data(), n2);
+        }
+        if (model->mem_enc.tpos[0]) {
+            model->wcache.tpos.resize(MD * model->hparams.num_maskmem);
+            sam3_read_f32(model->mem_enc.tpos[0], model->wcache.tpos.data(),
+                          MD * model->hparams.num_maskmem);
+        }
+        fprintf(stderr, "%s: device-transport weight caches populated\n", __func__);
+    }
+
     fprintf(stderr, "%s: model loaded successfully\n", __func__);
     return model;
 }
@@ -3706,6 +3828,10 @@ void sam3_state_set_orig_dims(sam3_state& state, int w, int h) {
 }
 
 void sam3_free_state(sam3_state& state) {
+    // Stage-transport twins (increment 2)
+    sam3_stagebuf_release(state.tw_sparse);
+    sam3_stagebuf_release(state.tw_image_pe);
+    sam3_stagebuf_release(state.tw_dense);
     if (state.galloc) {
         ggml_gallocr_free(state.galloc);
         state.galloc = nullptr;
@@ -6292,11 +6418,20 @@ static bool edgetam_perceiver_forward(
 
     // ── Read learnable latent tokens from model weights ─────────────────
     // latents_1d: ggml shape [64, 256] → ne[0]=64(D), ne[1]=256(N)
+    // (device-transport weight cache when populated — increment 2)
     std::vector<float> latents_1d_data(D * N_1d);
-    sam3_read_f32(perc.latents_1d, latents_1d_data.data(), D * N_1d);
+    if (!model.wcache.perc_latents_1d.empty())
+        std::copy(model.wcache.perc_latents_1d.begin(), model.wcache.perc_latents_1d.end(),
+                  latents_1d_data.begin());
+    else
+        sam3_read_f32(perc.latents_1d, latents_1d_data.data(), D * N_1d);
 
     std::vector<float> latents_2d_data(D * N_2d);
-    sam3_read_f32(perc.latents_2d, latents_2d_data.data(), D * N_2d);
+    if (!model.wcache.perc_latents_2d.empty())
+        std::copy(model.wcache.perc_latents_2d.begin(), model.wcache.perc_latents_2d.end(),
+                  latents_2d_data.begin());
+    else
+        sam3_read_f32(perc.latents_2d, latents_2d_data.data(), D * N_2d);
 
     // ── Prepare 2D windowed features on CPU ─────────────────────────────
     // mem_features layout: [D, H*W] (ggml: ne[0]=D, ne[1]=H*W, stored as
@@ -9798,8 +9933,11 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
     pd.num_obj_ptr_tokens = 0;
 
     // Read maskmem_tpos_enc from model (one tensor [MD, 1, 1, 7])
+    // (device-transport weight cache when populated — increment 2)
     std::vector<float> tpos_all(MD * hp.num_maskmem);
-    if (model.mem_enc.tpos[0]) {
+    if (!model.wcache.tpos.empty()) {
+        std::copy(model.wcache.tpos.begin(), model.wcache.tpos.end(), tpos_all.begin());
+    } else if (model.mem_enc.tpos[0]) {
         sam3_read_f32(model.mem_enc.tpos[0], tpos_all.data(), MD * hp.num_maskmem);
     }
 
@@ -10015,19 +10153,25 @@ static void sam3_extract_obj_ptr_cpu(
         // λ = (obj_score > 0) ? 1.0 : 0.0  (hard threshold, not sigmoid)
         float lambda = (obj_score > 0.0f) ? 1.0f : 0.0f;
 
-        // Project token through MLP
+        // Project token through MLP (weights from the device-transport cache
+        // when populated — increment 2; host driver reads verbatim as today)
         std::vector<float> h(D), tmp(D);
         std::copy(sam_token_data, sam_token_data + D, h.data());
         for (int j = 0; j < 3; ++j) {
             auto* w = model.obj_ptr_proj_w[j];
             auto* b = model.obj_ptr_proj_b[j];
             int nel_w = (int)(w->ne[0] * w->ne[1]);
-            std::vector<float> w_data(nel_w), b_data(D);
-            sam3_read_f32(w, w_data.data(), nel_w);
-            sam3_read_f32(b, b_data.data(), D);
+            const bool cached = !model.wcache.objptr_w[j].empty();
+            std::vector<float> w_data, b_data;
+            if (!cached) {
+                w_data.resize(nel_w); sam3_read_f32(w, w_data.data(), nel_w);
+                b_data.resize(D);     sam3_read_f32(b, b_data.data(), D);
+            }
+            const float* W = cached ? model.wcache.objptr_w[j].data() : w_data.data();
+            const float* B = cached ? model.wcache.objptr_b[j].data() : b_data.data();
             for (int o = 0; o < D; ++o) {
-                float sum = b_data[o];
-                for (int i = 0; i < D; ++i) sum += w_data[o * D + i] * h[i];
+                float sum = B[o];
+                for (int i = 0; i < D; ++i) sum += W[o * D + i] * h[i];
                 tmp[o] = (j < 2) ? std::max(0.0f, sum) : sum;
             }
             std::swap(h, tmp);
@@ -10035,7 +10179,10 @@ static void sam3_extract_obj_ptr_cpu(
 
         // Blend: obj_ptr = λ * projected + (1-λ) * no_obj_ptr
         std::vector<float> no_ptr(D);
-        ggml_backend_tensor_get(model.no_obj_ptr, no_ptr.data(), 0, D * sizeof(float));
+        if (!model.wcache.no_obj_ptr.empty())
+            std::copy(model.wcache.no_obj_ptr.begin(), model.wcache.no_obj_ptr.end(), no_ptr.begin());
+        else
+            ggml_backend_tensor_get(model.no_obj_ptr, no_ptr.data(), 0, D * sizeof(float));
         for (int i = 0; i < D; ++i)
             out_ptr[i] = lambda * h[i] + (1.0f - lambda) * no_ptr[i];
         return;
@@ -10043,7 +10190,10 @@ static void sam3_extract_obj_ptr_cpu(
 
     // SAM3 / default path: binary threshold
     if (obj_score <= 0.0f) {
-        ggml_backend_tensor_get(model.no_obj_ptr, out_ptr, 0, D * sizeof(float));
+        if (!model.wcache.no_obj_ptr.empty())
+            std::copy(model.wcache.no_obj_ptr.begin(), model.wcache.no_obj_ptr.end(), out_ptr);
+        else
+            ggml_backend_tensor_get(model.no_obj_ptr, out_ptr, 0, D * sizeof(float));
         return;
     }
 
@@ -10055,16 +10205,19 @@ static void sam3_extract_obj_ptr_cpu(
         auto* b = model.obj_ptr_proj_b[j];
 
         int nel_w = (int)(w->ne[0] * w->ne[1]);
-        std::vector<float> w_data(nel_w);
-        sam3_read_f32(w, w_data.data(), nel_w);
-
-        std::vector<float> b_data(D);
-        sam3_read_f32(b, b_data.data(), D);
+        const bool cached = !model.wcache.objptr_w[j].empty();
+        std::vector<float> w_data, b_data;
+        if (!cached) {
+            w_data.resize(nel_w); sam3_read_f32(w, w_data.data(), nel_w);
+            b_data.resize(D);     sam3_read_f32(b, b_data.data(), D);
+        }
+        const float* W = cached ? model.wcache.objptr_w[j].data() : w_data.data();
+        const float* B = cached ? model.wcache.objptr_b[j].data() : b_data.data();
 
         for (int o = 0; o < D; ++o) {
-            float sum = b_data[o];
+            float sum = B[o];
             for (int i = 0; i < D; ++i) {
-                sum += w_data[o * D + i] * h[i];
+                sum += W[o * D + i] * h[i];
             }
             tmp[o] = (j < 2) ? std::max(0.0f, sum) : sum;
         }
@@ -11088,6 +11241,7 @@ static void sam3_populate_pe_cache(sam3_state& state, const sam3_model& model) {
     }
 
     state.pe_cache_valid = true;
+    state.pe_cache_gen++;  // invalidate stage-transport twins keyed on this cache
     fprintf(stderr, "%s: PE cache populated (%d embeddings, %.1f KB dense grids)\n",
             __func__, pe_nel, 2.0f * D * H * H * sizeof(float) / 1024.0f);
 }
@@ -11901,6 +12055,7 @@ static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hpar
     }
 
     tracker.pe_caches_valid = true;
+    tracker.pe_gen++;  // invalidate stage-transport twins keyed on these caches
     SAM3_LOG(2, "%s: tracker PE caches populated (%.1f KB)\n", __func__,
              (tracker.cached_sinpe_256.size() + tracker.cached_sinpe_64.size() +
               tracker.cached_axial_cis_reord.size()) * sizeof(float) / 1024.0f);
@@ -12243,9 +12398,13 @@ static sam3_prop_output sam3_propagate_single(
         // Upload prompt data
         ggml_backend_tensor_set(prompt_t, pd.prompt.data(), 0, pd.prompt.size() * sizeof(float));
         ggml_backend_tensor_set(prompt_pos_t, pd.prompt_pos.data(), 0, pd.prompt_pos.size() * sizeof(float));
-        ggml_backend_tensor_set(rope_q_t, rope_q_reord.data(), 0, rope_q_reord.size() * sizeof(float));
+        sam3_stagebuf_push(model.transport, tracker.tw_rope_q, rope_q_reord.data(),
+                           rope_q_reord.size() * sizeof(float), rope_q_t,
+                           tracker.pe_gen, "rope_q");
         if (rope_k_t && !rope_k_data.empty())
-            ggml_backend_tensor_set(rope_k_t, rope_k_data.data(), 0, rope_k_data.size() * sizeof(float));
+            sam3_stagebuf_push(model.transport, tracker.tw_rope_k, rope_k_data.data(),
+                               rope_k_data.size() * sizeof(float), rope_k_t,
+                               tracker.pe_gen, "rope_k");
     }
 
     // Set default obj_score when pred_obj_scores=False (older SAM2 models)
@@ -12256,16 +12415,20 @@ static sam3_prop_output sam3_propagate_single(
 
     // Upload src_pos (sinusoidal PE 256-dim) — ggml mem-attn path only.
     if (src_pos_t)
-        ggml_backend_tensor_set(src_pos_t, tracker.cached_sinpe_256.data(), 0,
-                                tracker.cached_sinpe_256.size() * sizeof(float));
+        sam3_stagebuf_push(model.transport, tracker.tw_src_pos, tracker.cached_sinpe_256.data(),
+                           tracker.cached_sinpe_256.size() * sizeof(float), src_pos_t,
+                           tracker.pe_gen, "src_pos");
 
     // Upload not_a_point_embed, image_pe, dense_emb from state PE cache
     sam3_populate_pe_cache(state, model);
-    ggml_backend_tensor_set(sparse_in, state.not_a_point_cache, 0, D * sizeof(float));
-    ggml_backend_tensor_set(image_pe, state.dense_pe_cache.data(), 0,
-                            state.dense_pe_cache.size() * sizeof(float));
-    ggml_backend_tensor_set(dense_emb, state.dense_nomask_cache.data(), 0,
-                            state.dense_nomask_cache.size() * sizeof(float));
+    sam3_stagebuf_push(model.transport, state.tw_sparse, state.not_a_point_cache,
+                       D * sizeof(float), sparse_in, state.pe_cache_gen, "prop_sparse");
+    sam3_stagebuf_push(model.transport, state.tw_image_pe, state.dense_pe_cache.data(),
+                       state.dense_pe_cache.size() * sizeof(float), image_pe,
+                       state.pe_cache_gen, "prop_pe");
+    sam3_stagebuf_push(model.transport, state.tw_dense, state.dense_nomask_cache.data(),
+                       state.dense_nomask_cache.size() * sizeof(float), dense_emb,
+                       state.pe_cache_gen, "prop_dense");
 
     // Copy tracker features from state to fresh input tensors (transport
     // driver: host = today's round-trip, device = same-backend D2D).
@@ -13227,6 +13390,11 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     for (auto* b : tracker.owned_buffers)
         if (b) ggml_backend_buffer_free(b);
     tracker.owned_buffers.clear();
+    // Stage-transport twins (increment 2): release with the other device
+    // resources; they repopulate lazily on the next device-mode propagate.
+    sam3_stagebuf_release(tracker.tw_rope_q);
+    sam3_stagebuf_release(tracker.tw_rope_k);
+    sam3_stagebuf_release(tracker.tw_src_pos);
     if (tracker.ctx) {
         ggml_free(tracker.ctx);
         tracker.ctx = nullptr;
