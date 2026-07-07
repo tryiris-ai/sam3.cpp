@@ -935,6 +935,87 @@ struct edgetam_perceiver {
 };
 
 /*****************************************************************************
+** Stage-transport driver (CUDA device residency)
+**
+** report/CUDA-RESIDENCY-DESIGN.md (trackbench Windows port). The CLAUDE.md
+** stage-isolation pattern moves inter-stage tensors through CPU-side
+** std::vector buffers — free on Apple unified memory, ~231 MB/frame over
+** PCIe on a discrete NVIDIA card (~95% of GPU time measured as memcpy).
+** This driver changes ONLY the transport between stages:
+**   HOST   (default on EVERY backend): today's exact instruction sequence —
+**          ggml_backend_tensor_get into a temp vector + tensor_set. The mac
+**          Metal/CoreML path is byte-identical by construction.
+**   DEVICE (CUDA only, opt-in via SAM3_STAGE_TRANSPORT=device): one
+**          same-backend D2D ggml_backend_tensor_copy — byte-identical
+**          destination bytes, zero PCIe. In-tree precedent: the encoder's
+**          steady-state FPN → state.neck_trk copy.
+** Graph isolation (CLAUDE.md rules 1-2) is untouched: per-stage graphs and
+** fresh input leaves stay; only HOW bytes reach those leaves changes.
+*****************************************************************************/
+
+enum sam3_transport_kind { SAM3_TRANSPORT_HOST = 0, SAM3_TRANSPORT_DEVICE = 1 };
+
+struct sam3_transport {
+    sam3_transport_kind kind    = SAM3_TRANSPORT_HOST;
+    ggml_backend_t      backend = nullptr;
+};
+
+static bool sam3_same_layout(const struct ggml_tensor* a, const struct ggml_tensor* b) {
+    if (a->type != b->type) return false;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i)
+        if (a->ne[i] != b->ne[i] || a->nb[i] != b->nb[i]) return false;
+    return true;
+}
+
+// Persistent tensor -> fresh graph-input tensor. Device mode pre-checks and
+// DEGRADES to the verbatim host path with a once-per-site stderr line instead
+// of aborting — a silently degraded site is then caught by the per-increment
+// nsys transfer-count assert as count drift, never as wrongness.
+static void sam3_stage_feed(const sam3_transport& tr, struct ggml_tensor* src,
+                            struct ggml_tensor* dst, const char* site) {
+    GGML_ASSERT(ggml_nbytes(src) == ggml_nbytes(dst));
+    if (tr.kind == SAM3_TRANSPORT_DEVICE) {
+        if (sam3_same_layout(src, dst) &&
+            !ggml_backend_buffer_is_host(src->buffer) &&
+            !ggml_backend_buffer_is_host(dst->buffer)) {
+            ggml_backend_tensor_copy(src, dst);  // same-backend D2D, self-fencing
+            return;
+        }
+        static std::map<std::string, bool> warned;
+        if (!warned[site]) {
+            warned[site] = true;
+            fprintf(stderr, "sam3_stage_feed: %s: layout/buffer mismatch — using host path\n", site);
+        }
+    }
+    std::vector<float> tmp(ggml_nbytes(src) / sizeof(float));
+    ggml_backend_tensor_get(src, tmp.data(), 0, ggml_nbytes(src));
+    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+}
+
+// Resolved once at model load, after the backend chain (Metal>CUDA>Vulkan>CPU).
+// Default host on every backend; device only when explicitly requested AND the
+// answered backend is CUDA — Metal can never pass this gate, so the mac cannot
+// select the device driver under any configuration.
+static void sam3_transport_init(sam3_transport& tr, ggml_backend_t backend) {
+    tr.backend = backend;
+    tr.kind    = SAM3_TRANSPORT_HOST;
+    const char* env = getenv("SAM3_STAGE_TRANSPORT");
+    const bool force_host  = env && strcmp(env, "host") == 0;
+    const bool want_device = env && strcmp(env, "device") == 0;
+    (void)force_host;
+#ifdef GGML_USE_CUDA
+    if (want_device && !force_host && ggml_backend_is_cuda(backend)) {
+        tr.kind = SAM3_TRANSPORT_DEVICE;
+        fprintf(stderr, "%s: stage transport = device (CUDA-resident)\n", __func__);
+        if (getenv("SAM3_GGML_ENCODER_AHEAD"))
+            fprintf(stderr, "%s: note: encoder-ahead handoff stays host-float until its copy_async clause lands\n", __func__);
+    }
+#endif
+    if (want_device && tr.kind != SAM3_TRANSPORT_DEVICE)
+        fprintf(stderr, "%s: SAM3_STAGE_TRANSPORT=device requested but backend is not CUDA; using host\n", __func__);
+}
+
+/*****************************************************************************
 ** Top-Level Opaque Types (defined here, forward-declared in sam3.h)
 *****************************************************************************/
 
@@ -987,6 +1068,9 @@ struct sam3_model {
     struct ggml_context*    ctx     = nullptr;
     ggml_backend_t          backend = nullptr;
     ggml_backend_buffer_t   buffer  = nullptr;
+
+    // stage-transport driver (host default everywhere; CUDA device opt-in)
+    sam3_transport          transport;
 
     // tensor lookup
     std::map<std::string, struct ggml_tensor*> tensors;
@@ -3489,6 +3573,7 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         fprintf(stderr, "%s: failed to init backend\n", __func__);
         return nullptr;
     }
+    sam3_transport_init(model->transport, model->backend);
 
     // ── Create ggml context (no_alloc — we use backend_alloc_ctx_tensors)
     // Estimate: ~3000 tensors, generous overhead
@@ -12047,7 +12132,7 @@ static sam3_prop_output sam3_propagate_single(
 
     // Memory-attention inputs (ggml path only). In the CoreML mem-attn path these
     // stay null and cond_spatial is an input tensor filled from the CoreML output.
-    struct ggml_tensor* curr = nullptr, * src_pos_t = nullptr;
+    struct ggml_tensor* curr = nullptr, * curr_in = nullptr, * src_pos_t = nullptr;
     struct ggml_tensor* prompt_t = nullptr, * prompt_pos_t = nullptr;
     struct ggml_tensor* rope_q_t = nullptr, * rope_k_t = nullptr;
     struct ggml_tensor* cond_spatial = nullptr;
@@ -12061,8 +12146,23 @@ static sam3_prop_output sam3_propagate_single(
         // CRITICAL: create fresh input tensors for state features.
         // Using state.neck_trk[*] directly as ggml_reshape operands pulls in
         // the entire ViT+neck recomputation from the image encoder graph.
-        curr = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
-        ggml_set_name(curr, "prop_curr"); ggml_set_input(curr);
+        if (model.transport.kind == SAM3_TRANSPORT_DEVICE) {
+            // Device transport: the fresh input LEAF mirrors state.neck_trk[2]'s
+            // 4D layout so sam3_stage_feed can whole-tensor D2D into it; the
+            // mem-attn builder still sees [D, N, 1] via an in-graph reshape of
+            // the fresh leaf (no src[] ancestry — CLAUDE.md rule 2 cannot fire).
+            // Host mode keeps today's 3D tensor and graph bit-for-bit.
+            curr_in = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                                         state.neck_trk[2]->ne[0],
+                                         state.neck_trk[2]->ne[1],
+                                         state.neck_trk[2]->ne[2], 1);
+            ggml_set_name(curr_in, "prop_curr"); ggml_set_input(curr_in);
+            curr = ggml_reshape_3d(ctx0, curr_in, D, N, 1);
+        } else {
+            curr = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
+            ggml_set_name(curr, "prop_curr"); ggml_set_input(curr);
+            curr_in = curr;
+        }
 
         // src_pos (sinusoidal PE 256-dim for 72×72)
         src_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
@@ -12167,21 +12267,14 @@ static sam3_prop_output sam3_propagate_single(
     ggml_backend_tensor_set(dense_emb, state.dense_nomask_cache.data(), 0,
                             state.dense_nomask_cache.size() * sizeof(float));
 
-    // Copy tracker features from state to fresh input tensors
+    // Copy tracker features from state to fresh input tensors (transport
+    // driver: host = today's round-trip, device = same-backend D2D).
     {
         if (curr) {  // ggml mem-attn path only (CoreML reads neck_trk[2] itself)
-            std::vector<float> c2(D * N);
-            ggml_backend_tensor_get(state.neck_trk[2], c2.data(), 0, D * N * sizeof(float));
-            ggml_backend_tensor_set(curr, c2.data(), 0, D * N * sizeof(float));
+            sam3_stage_feed(model.transport, state.neck_trk[2], curr_in, "prop_curr");
         }
-
-        std::vector<float> s0(D * H0 * H0);
-        ggml_backend_tensor_get(state.neck_trk[0], s0.data(), 0, D * H0 * H0 * sizeof(float));
-        ggml_backend_tensor_set(trk_s0, s0.data(), 0, D * H0 * H0 * sizeof(float));
-
-        std::vector<float> s1(D * H1 * H1);
-        ggml_backend_tensor_get(state.neck_trk[1], s1.data(), 0, D * H1 * H1 * sizeof(float));
-        ggml_backend_tensor_set(trk_s1, s1.data(), 0, D * H1 * H1 * sizeof(float));
+        sam3_stage_feed(model.transport, state.neck_trk[0], trk_s0, "prop_trk_s0");
+        sam3_stage_feed(model.transport, state.neck_trk[1], trk_s1, "prop_trk_s1");
     }
 
     // RFD 0011 U0: backend compute of the shared mem-attn + mask-decoder graph
@@ -12558,12 +12651,8 @@ static bool sam3_encode_memory(
     SAM3_TIME_END(mem_encoder_alloc_ms, _t_mem_alloc);
 
     ggml_backend_tensor_set(mask_in, m_interp.data(), 0, m_interp.size() * sizeof(float));
-    // Copy pixel features from state tensor to fresh input
-    {
-        std::vector<float> pix_data(D * H * H);
-        ggml_backend_tensor_get(state.neck_trk[2], pix_data.data(), 0, D * H * H * sizeof(float));
-        ggml_backend_tensor_set(pix_in_raw, pix_data.data(), 0, D * H * H * sizeof(float));
-    }
+    // Copy pixel features from state tensor to fresh input (transport driver)
+    sam3_stage_feed(model.transport, state.neck_trk[2], pix_in_raw, "mem_pix_feat");
     // RFD 0011 U0: backend compute of the memory encoder (mem_encoder_compute_ms).
     SAM3_TIME_BEGIN(_t_mem_compute);
     if (!sam3_graph_compute(model.backend, g, 4)) {
