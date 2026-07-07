@@ -3915,6 +3915,43 @@ static struct ggml_tensor* sam3_apply_rope(struct ggml_context* ctx,
     return ggml_reshape_3d(ctx, ggml_cont(ctx, out), head_dim, N, nheads_B);
 }
 
+// ── CUDA flash-attn head-dim fallback (Windows x64 + CUDA port) ──────────────
+// ggml-CUDA's fused flash-attention kernels only cover head sizes
+// {40,64,72,80,96,112,128,256,576} (ggml-cuda/fattn.cu). EdgeTAM's SAM
+// mask-decoder attention uses head_dim=32, for which the CUDA selector returns
+// BEST_FATTN_KERNEL_NONE and GGML_ABORTs. Metal and Vulkan accept head_dim=32,
+// so this is a CUDA-only gap — NOT a model/graph change. On the CUDA build ONLY
+// we route the unsupported head dims through a mathematically equivalent manual
+// attention (the exact idiom the fork already uses for the fp32-mask path in
+// sam3_ddec_layer_forward): QK^T → soft_max_ext(scale,+mask) → ·V, laid out to
+// match ggml_flash_attn_ext's [HD, NH, N_q, B] output so every call site is
+// unchanged. On non-CUDA builds this forwards verbatim to ggml_flash_attn_ext,
+// so the Metal/CoreML path and its numerics are byte-for-byte untouched.
+static struct ggml_tensor* sam3_fa_ext(struct ggml_context* ctx,
+                                       struct ggml_tensor* q,     // [HD, N_q,  NH,    B]
+                                       struct ggml_tensor* k,     // [HD, N_kv, NH_kv, B]
+                                       struct ggml_tensor* v,     // [HD, N_kv, NH_kv, B]
+                                       struct ggml_tensor* mask,  // additive [N_kv, N_q, ...] or null
+                                       float scale, float max_bias, float logit_softcap) {
+#ifdef GGML_USE_CUDA
+    const int64_t hd = q->ne[0];
+    const bool fa_ok =
+        (hd == 40 || hd == 64 || hd == 72 || hd == 80 || hd == 96 ||
+         hd == 112 || hd == 128 || hd == 256 || hd == 576) &&
+        k->ne[0] == hd && v->ne[0] == hd &&
+        max_bias == 0.0f && logit_softcap == 0.0f;
+    if (!fa_ok) {
+        struct ggml_tensor* kq = ggml_mul_mat(ctx, k, q);                 // [N_kv, N_q, NH, B]
+        kq = ggml_soft_max_ext(ctx, kq, mask, scale, max_bias);           // softmax(scale*kq + mask)
+        struct ggml_tensor* v_t = ggml_cont(ctx, ggml_transpose(ctx, v)); // [N_kv, HD, NH_kv, B]
+        struct ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq);             // [HD, N_q, NH, B]
+        kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));         // [HD, NH, N_q, B]
+        return kqv;
+    }
+#endif
+    return ggml_flash_attn_ext(ctx, q, k, v, mask, scale, max_bias, logit_softcap);
+}
+
 // Single ViT block forward: pre-norm → attn (window or global, with RoPE) → residual → pre-norm → MLP → residual
 // x: [E, W, H, B] in ggml layout (following sam.cpp convention)
 static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
@@ -3981,7 +4018,7 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
         K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* attn_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         // flash_attn_ext returns [HD, NH, N, B_cur] — HD and NH adjacent,
         // so reshaping directly to [E, W, H, B] is correct.
         x = ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur);
@@ -4201,7 +4238,7 @@ static struct ggml_tensor* sam3_text_block_forward(struct ggml_context* ctx,
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous; flash_attn uses strides
 
     float scale = 1.0f / sqrtf((float)HD);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, causal_mask, scale, 0.0f, 0.0f);
+    auto* attn_out = sam3_fa_ext(ctx, Q, K, V, causal_mask, scale, 0.0f, 0.0f);
     x = ggml_reshape_2d(ctx, attn_out, E, L);
 
     x = ggml_mul_mat(ctx, blk.attn_out_proj_w, x);
@@ -4602,7 +4639,7 @@ static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous OK for flash_attn
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
+    auto* attn_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
 
     // Recombine: flash_attn output is [HD, N_q, NH, B_win]
     // → reshape to [C_out, N_q, B_win]
@@ -6013,7 +6050,7 @@ static struct ggml_tensor* edgetam_perceiver_layer_forward(
         k = ggml_reshape_4d(ctx, k, D, N_x,   1, batch);
         v = ggml_reshape_4d(ctx, v, D, N_x,   1, batch);
 
-        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        auto* attn = sam3_fa_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
         // Output: [D, 1, N_lat, batch] (permuted) → reshape to [D, N_lat, batch]
         attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
 
@@ -6051,7 +6088,7 @@ static struct ggml_tensor* edgetam_perceiver_layer_forward(
         k = ggml_reshape_4d(ctx, k, D, N_lat, 1, batch);
         v = ggml_reshape_4d(ctx, v, D, N_lat, 1, batch);
 
-        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        auto* attn = sam3_fa_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
         attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
 
         auto* sa_out = ggml_mul_mat(ctx, layer.sa_out_w, attn);
@@ -7353,7 +7390,7 @@ static struct ggml_tensor * sam3_build_vit_attn_core_from_qkv(struct ggml_contex
     K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
 
     const float scale = 1.0f / sqrtf((float) HD);
-    struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    struct ggml_tensor * attn_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
 
     return ggml_cont(ctx, ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur));
 }
@@ -8070,7 +8107,7 @@ static struct ggml_tensor* sam3_multihead_attn_fused(
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N_kv, NH, B] non-contiguous; flash_attn uses strides
 
     float scale = 1.0f / sqrtf((float)HD);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
+    auto* attn_out = sam3_fa_ext(ctx, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
 
     auto* merged = ggml_reshape_3d(ctx, attn_out, D, N_q, B);
     merged = ggml_mul_mat(ctx, out_proj_w, merged);
@@ -8253,7 +8290,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, S, 1);
 
             sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -8295,7 +8332,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, S_q, 1);
 
             ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8603,7 +8640,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
 
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -8645,7 +8682,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
 
         auto* ca_mask = sam3_expand_token_attn_bias(ctx, prompt_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, ca_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_fa_ext(ctx, Q, K, V, ca_mask, scale, 0.0f, 0.0f);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
 
         ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -9021,7 +9058,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
         sa_out = ggml_add(ctx, sa_out, ly.sa_out_proj_b);
@@ -9064,7 +9101,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
 
         auto* text_mask = sam3_expand_token_attn_bias(ctx, text_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, text_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_fa_ext(ctx, Q, K, V, text_mask, scale, 0.0f, 0.0f);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
         ca_out = ggml_mul_mat(ctx, ly.ca_text_out_w, ca_out);
         ca_out = ggml_add(ctx, ca_out, ly.ca_text_out_b);
@@ -9120,7 +9157,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
             ca_out = ggml_mul_mat(ctx, v_t, kq);                 // [HD, N_q, NH, B]
             ca_out = ggml_cont(ctx, ggml_permute(ctx, ca_out, 0, 2, 1, 3));
         } else {
-            ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            ca_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         }
 
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
@@ -9800,7 +9837,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* sa_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_fa_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, N, 1);
             sa_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_out_w, sa_out), ly.sa_out_b);
             x = ggml_add(ctx, x, sa_out);
@@ -9845,7 +9882,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* ca_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_fa_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, N, 1);
             ca_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_out_w, ca_out), ly.ca_out_b);
             x = ggml_add(ctx, x, ca_out);
@@ -10819,7 +10856,7 @@ static struct ggml_tensor* sam3_sam_attention(
 
     // Attention
     float scale = 1.0f / sqrtf((float)HD);
-    auto* out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    auto* out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
     // out: [HD, NH, N_q, B] (flash_attn_ext swaps dims 1,2 vs input)
 
 #if 0  // Manual SDPA (for debugging only)
