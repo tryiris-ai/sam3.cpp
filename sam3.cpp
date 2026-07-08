@@ -978,7 +978,13 @@ static void sam3_stage_feed(const sam3_transport& tr, struct ggml_tensor* src,
         if (sam3_same_layout(src, dst) &&
             !ggml_backend_buffer_is_host(src->buffer) &&
             !ggml_backend_buffer_is_host(dst->buffer)) {
-            ggml_backend_tensor_copy(src, dst);  // same-backend D2D, self-fencing
+            // Async same-backend D2D (increment 5): queued on the backend's
+            // compute stream, so FIFO ordering serializes it before the
+            // graph_compute that consumes dst — no per-copy fence needed.
+            // Every feed source is long-lived (persistent state / ring /
+            // twins, or a graph output whose gallocr outlives the consuming
+            // compute), so the async copy can never read recycled memory.
+            ggml_backend_tensor_copy_async(tr.backend, tr.backend, src, dst);
             return;
         }
         static std::map<std::string, bool> warned;
@@ -1049,7 +1055,9 @@ static void sam3_stagebuf_push(const sam3_transport& tr, sam3_stagebuf& sb,
         ggml_backend_tensor_set(sb.dev, host, 0, nbytes);  // one upload per content change
         sb.gen = gen;
     }
-    ggml_backend_tensor_copy(sb.dev, dst);  // same-backend D2D
+    // Async D2D from the persistent twin (increment 5) — same-stream FIFO
+    // orders it before the consuming graph_compute; the twin never moves.
+    ggml_backend_tensor_copy_async(tr.backend, tr.backend, sb.dev, dst);
 }
 
 // Resolved once at model load, after the backend chain (Metal>CUDA>Vulkan>CPU).
@@ -1062,11 +1070,15 @@ static void sam3_transport_init(sam3_transport& tr, ggml_backend_t backend) {
     const char* env = getenv("SAM3_STAGE_TRANSPORT");
     const bool force_host  = env && strcmp(env, "host") == 0;
     const bool want_device = env && strcmp(env, "device") == 0;
-    (void)force_host;
+    (void)force_host; (void)want_device;
 #ifdef GGML_USE_CUDA
-    if (want_device && !force_host && ggml_backend_is_cuda(backend)) {
+    // Increment 5: device is the DEFAULT on CUDA (SAM3_STAGE_TRANSPORT=host is
+    // the escape hatch). This flip lives inside ggml_backend_is_cuda, which
+    // Metal/Vulkan/CPU can never pass — every other backend stays host.
+    if (!force_host && ggml_backend_is_cuda(backend)) {
         tr.kind = SAM3_TRANSPORT_DEVICE;
-        fprintf(stderr, "%s: stage transport = device (CUDA-resident)\n", __func__);
+        fprintf(stderr, "%s: stage transport = device (CUDA-resident%s)\n", __func__,
+                want_device ? "" : ", default");
         if (getenv("SAM3_GGML_ENCODER_AHEAD"))
             fprintf(stderr, "%s: note: encoder-ahead handoff stays host-float until its copy_async clause lands\n", __func__);
     }
