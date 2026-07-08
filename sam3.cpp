@@ -1268,6 +1268,23 @@ static void sam3_prop_gcache_release(sam3_prop_gcache& gc) {
     gc = sam3_prop_gcache();
 }
 
+// Generic small-stage cache (same addendum-4 contract as sam3_prop_gcache)
+// for stages with few leaves: memory encoder, perceiver 1D/2D sub-graphs.
+struct sam3_stage_gcache {
+    struct ggml_context* ctx    = nullptr;
+    struct ggml_cgraph*  graph  = nullptr;
+    struct ggml_gallocr* galloc = nullptr;
+    uint64_t             key    = 0;
+    struct ggml_tensor*  in[3]  = {};
+    struct ggml_tensor*  out[1] = {};
+};
+
+static void sam3_stage_gcache_release(sam3_stage_gcache& gc) {
+    if (gc.galloc) ggml_gallocr_free(gc.galloc);
+    if (gc.ctx) ggml_free(gc.ctx);
+    gc = sam3_stage_gcache();
+}
+
 // FNV-style mix for graph-cache keys.
 static inline void sam3_key_mix(uint64_t& k, uint64_t v) {
     k ^= v + 0x9e3779b97f4a7c15ull + (k << 6) + (k >> 2);
@@ -1386,6 +1403,8 @@ struct sam3_tracker {
 
     // Increment 6: cached propagate (mem-attn + decoder) stage graph.
     sam3_prop_gcache gc_prop;
+    // Increment 6b: cached memory-encoder + perceiver sub-graphs.
+    sam3_stage_gcache gc_memenc, gc_perc1, gc_perc2;
 };
 
 // Increment 3: acquire a bank-slot tensor pair (feats + pe sharing one backend
@@ -6595,24 +6614,42 @@ static bool edgetam_perceiver_forward(
     // ══════════════════════════════════════════════════════════════════════
     std::vector<float> result_1d(D * N_1d);
     {
+        // Increment 6b: cached 1D sub-graph (fixed shapes; device driver only)
+        const bool use_pgc = trk && model.transport.kind == SAM3_TRANSPORT_DEVICE;
+        uint64_t pkey = 1469598103934665603ull;
+        sam3_key_mix(pkey, (uint64_t)D); sam3_key_mix(pkey, (uint64_t)HW);
+        sam3_key_mix(pkey, (uint64_t)N_1d);
+        sam3_key_mix(pkey, mem_features_dev ? 2ull : 1ull);
+        sam3_stage_gcache* pgc = use_pgc ? &trk->gc_perc1 : nullptr;
+        const bool pgc_hit = pgc && pgc->ctx && pgc->key == pkey;
+        if (pgc && !pgc_hit && pgc->ctx) sam3_stage_gcache_release(*pgc);
+
+        struct ggml_context* ctx0 = nullptr;
+        struct ggml_tensor* lat_in = nullptr, * x4 = nullptr, * x_in = nullptr;
+        struct ggml_tensor* pos_in = nullptr, * latents = nullptr;
+        struct ggml_cgraph* graph = nullptr;
+        struct ggml_gallocr* galloc = nullptr;
+        if (pgc_hit) {
+            ctx0 = pgc->ctx; graph = pgc->graph; galloc = pgc->galloc;
+            lat_in = pgc->in[0]; x4 = pgc->in[1]; pos_in = pgc->in[2];
+            latents = pgc->out[0];
+        } else {
         const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
         struct ggml_init_params gparams = {buf_size, nullptr, true};
-        auto* ctx0 = ggml_init(gparams);
+        ctx0 = ggml_init(gparams);
         if (!ctx0) {
             fprintf(stderr, "%s: failed to init 1D context\n", __func__);
             return false;
         }
 
         // Input tensors (fresh, no dependency chains)
-        auto* lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N_1d, 1);
+        lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N_1d, 1);
         ggml_set_name(lat_in, "lat_1d_in");
         ggml_set_input(lat_in);
 
         // Device transport: the fresh leaf mirrors the memenc output's 4D
         // layout so it can be fed by whole-tensor D2D; the graph still sees
         // [D, HW, 1] via an in-graph reshape of the leaf (curr-fix pattern).
-        struct ggml_tensor* x4 = nullptr;
-        struct ggml_tensor* x_in = nullptr;
         if (mem_features_dev) {
             x4 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, mem_features_dev->ne[0],
                                     mem_features_dev->ne[1], mem_features_dev->ne[2], 1);
@@ -6625,12 +6662,12 @@ static bool edgetam_perceiver_forward(
             x4 = x_in;
         }
 
-        auto* pos_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
+        pos_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
         ggml_set_name(pos_in, "pos_1d_in");
         ggml_set_input(pos_in);
 
         // Run perceiver layers
-        auto* latents = lat_in;
+        latents = lat_in;
         for (int l = 0; l < n_layers; ++l) {
             latents = edgetam_perceiver_layer_forward(ctx0, latents, x_in, pos_in,
                                                       perc.layers[l]);
@@ -6642,10 +6679,10 @@ static bool edgetam_perceiver_forward(
         ggml_set_output(latents);
 
         // Build + allocate + compute
-        auto* graph = ggml_new_graph_custom(ctx0, 16384, false);
+        graph = ggml_new_graph_custom(ctx0, 16384, false);
         ggml_build_forward_expand(graph, latents);
 
-        auto* galloc = ggml_gallocr_new(
+        galloc = ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(galloc, graph) ||
             !ggml_gallocr_alloc_graph(galloc, graph)) {
@@ -6654,6 +6691,13 @@ static bool edgetam_perceiver_forward(
             ggml_free(ctx0);
             return false;
         }
+
+        if (use_pgc) {
+            pgc->ctx = ctx0; pgc->graph = graph; pgc->galloc = galloc; pgc->key = pkey;
+            pgc->in[0] = lat_in; pgc->in[1] = x4; pgc->in[2] = pos_in;
+            pgc->out[0] = latents;
+        }
+        }  // end build path
 
         // Set inputs (device transport: latents/pos via persistent twins,
         // features by D2D from the live memenc output — increment 4)
@@ -6677,16 +6721,22 @@ static bool edgetam_perceiver_forward(
 
         if (!sam3_graph_compute(model.backend, graph, 4)) {
             fprintf(stderr, "%s: 1D graph compute failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
+            if (pgc && (pgc_hit || pgc->ctx)) {
+                sam3_stage_gcache_release(*pgc);
+            } else {
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx0);
+            }
             return false;
         }
 
         ggml_backend_tensor_get(latents, result_1d.data(), 0,
                                 D * N_1d * sizeof(float));
 
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
+        if (!use_pgc) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -6694,9 +6744,28 @@ static bool edgetam_perceiver_forward(
     // ══════════════════════════════════════════════════════════════════════
     std::vector<float> result_2d(D * N_2d);
     {
+        // Increment 6b: cached 2D sub-graph (fixed shapes; device driver only)
+        const bool use_pgc = trk && model.transport.kind == SAM3_TRANSPORT_DEVICE;
+        uint64_t pkey = 1469598103934665603ull;
+        sam3_key_mix(pkey, (uint64_t)D); sam3_key_mix(pkey, (uint64_t)ws2);
+        sam3_key_mix(pkey, (uint64_t)N_2d);
+        sam3_key_mix(pkey, mem_features_dev ? 2ull : 1ull);
+        sam3_stage_gcache* pgc = use_pgc ? &trk->gc_perc2 : nullptr;
+        const bool pgc_hit = pgc && pgc->ctx && pgc->key == pkey;
+        if (pgc && !pgc_hit && pgc->ctx) sam3_stage_gcache_release(*pgc);
+
+        struct ggml_context* ctx0 = nullptr;
+        struct ggml_tensor* x4 = nullptr, * x_in = nullptr, * lat_in = nullptr;
+        struct ggml_tensor* lat_out = nullptr;
+        struct ggml_cgraph* graph = nullptr;
+        struct ggml_gallocr* galloc = nullptr;
+        if (pgc_hit) {
+            ctx0 = pgc->ctx; graph = pgc->graph; galloc = pgc->galloc;
+            x4 = pgc->in[0]; lat_in = pgc->in[1]; lat_out = pgc->out[0];
+        } else {
         const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
         struct ggml_init_params gparams = {buf_size, nullptr, true};
-        auto* ctx0 = ggml_init(gparams);
+        ctx0 = ggml_init(gparams);
         if (!ctx0) {
             fprintf(stderr, "%s: failed to init 2D context\n", __func__);
             return false;
@@ -6712,8 +6781,6 @@ static bool edgetam_perceiver_forward(
         //   → [D*ws, ws, nw, nw]           split y into (iy, wy)
         //   → perm(0,1,3,2) → [D*ws, ws, nw, nw]  (d·ix, iy, wx, wy)
         //   → [D, ws2, N_2d]               token = iy*ws+ix, window = wy*nw+wx
-        struct ggml_tensor* x4 = nullptr;
-        struct ggml_tensor* x_in = nullptr;
         if (mem_features_dev) {
             x4 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, mem_features_dev->ne[0],
                                     mem_features_dev->ne[1], mem_features_dev->ne[2], 1);
@@ -6731,7 +6798,7 @@ static bool edgetam_perceiver_forward(
         }
 
         // Input: latents [D, 1, N_2d] — 1 latent per window
-        auto* lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, N_2d);
+        lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, N_2d);
         ggml_set_name(lat_in, "lat_2d_in");
         ggml_set_input(lat_in);
 
@@ -6743,17 +6810,17 @@ static bool edgetam_perceiver_forward(
         }
 
         // The 2D latents: [D, 1, N_2d] → squeeze to [D, N_2d] for output
-        auto* lat_out = ggml_reshape_2d(ctx0, latents, D, N_2d);
+        lat_out = ggml_reshape_2d(ctx0, latents, D, N_2d);
 
         // Final LayerNorm (shared norm_w/norm_b)
         lat_out = sam3_layer_norm(ctx0, lat_out, perc.norm_w, perc.norm_b);
         ggml_set_name(lat_out, "lat_2d_out");
         ggml_set_output(lat_out);
 
-        auto* graph = ggml_new_graph_custom(ctx0, 16384, false);
+        graph = ggml_new_graph_custom(ctx0, 16384, false);
         ggml_build_forward_expand(graph, lat_out);
 
-        auto* galloc = ggml_gallocr_new(
+        galloc = ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(galloc, graph) ||
             !ggml_gallocr_alloc_graph(galloc, graph)) {
@@ -6762,6 +6829,13 @@ static bool edgetam_perceiver_forward(
             ggml_free(ctx0);
             return false;
         }
+
+        if (use_pgc) {
+            pgc->ctx = ctx0; pgc->graph = graph; pgc->galloc = galloc; pgc->key = pkey;
+            pgc->in[0] = x4; pgc->in[1] = lat_in;
+            pgc->out[0] = lat_out;
+        }
+        }  // end build path
 
         // Set windowed features (device: D2D from the live memenc output; the
         // partition itself runs in-graph)
@@ -6781,16 +6855,22 @@ static bool edgetam_perceiver_forward(
 
         if (!sam3_graph_compute(model.backend, graph, 4)) {
             fprintf(stderr, "%s: 2D graph compute failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
+            if (pgc && (pgc_hit || pgc->ctx)) {
+                sam3_stage_gcache_release(*pgc);
+            } else {
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx0);
+            }
             return false;
         }
 
         ggml_backend_tensor_get(lat_out, result_2d.data(), 0,
                                 D * N_2d * sizeof(float));
 
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
+        if (!use_pgc) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -13151,12 +13231,33 @@ static bool sam3_encode_memory(
     // RFD 0011 U0: memory-encoder graph CONSTRUCTION region (mem_encoder_build_ms).
     // U1 will reuse this graph across frames; build_ms+alloc_ms should drop to ~0.
     SAM3_TIME_BEGIN(_t_mem_build);
+    // Increment 6b: cached memory-encoder graph (CLAUDE.md addendum 4) — fixed
+    // shapes at a given feat size, so steady state hits every credible frame.
+    const bool use_mgc = model.transport.kind == SAM3_TRANSPORT_DEVICE;
+    uint64_t mkey = 1469598103934665603ull;
+    sam3_key_mix(mkey, (uint64_t)H);
+    sam3_key_mix(mkey, (uint64_t)INTERPOL);
+    sam3_key_mix(mkey, (uint64_t)D);
+    auto& mgc = tracker.gc_memenc;
+    const bool mgc_hit = use_mgc && mgc.ctx && mgc.key == mkey;
+    if (use_mgc && !mgc_hit && mgc.ctx) sam3_stage_gcache_release(mgc);
+
+    struct ggml_context* ctx0 = nullptr;
+    struct ggml_tensor* mask_in = nullptr;
+    struct ggml_tensor* pix_in_raw = nullptr;
+    struct ggml_tensor* mo = nullptr;
+    struct ggml_cgraph* g = nullptr;
+    struct ggml_gallocr* ga = nullptr;
+    if (mgc_hit) {
+        ctx0 = mgc.ctx; g = mgc.graph; ga = mgc.galloc;
+        mask_in = mgc.in[0]; pix_in_raw = mgc.in[1]; mo = mgc.out[0];
+    } else {
     const size_t bs = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
     struct ggml_init_params gp = {bs, nullptr, true};
-    auto* ctx0 = ggml_init(gp);
+    ctx0 = ggml_init(gp);
     if (!ctx0) return false;
 
-    auto* mask_in = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, INTERPOL, INTERPOL, 1, 1);
+    mask_in = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, INTERPOL, INTERPOL, 1, 1);
     ggml_set_name(mask_in, "mem_mask");
     ggml_set_input(mask_in);
 
@@ -13179,7 +13280,7 @@ static bool sam3_encode_memory(
 
     // Pixel projection — use fresh input tensor to avoid pulling in the
     // entire ViT+neck recomputation from state.neck_trk[2]'s dependency tree
-    auto* pix_in_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+    pix_in_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
     ggml_set_name(pix_in_raw, "mem_pix_feat");
     ggml_set_input(pix_in_raw);
     auto* pix_in = ggml_cont(ctx0, ggml_permute(ctx0, pix_in_raw, 2, 0, 1, 3));
@@ -13197,19 +13298,19 @@ static bool sam3_encode_memory(
                                      model.mem_enc.fuser_fc2_w[i], model.mem_enc.fuser_fc2_b[i],
                                      model.mem_enc.fuser_gamma[i]);
     auto* fused_out = ggml_cont(ctx0, ggml_permute(ctx0, fused, 2, 0, 1, 3));
-    auto* mo = ggml_conv_2d(ctx0, model.mem_enc.out_proj_w, fused_out, 1, 1, 0, 0, 1, 1);
+    mo = ggml_conv_2d(ctx0, model.mem_enc.out_proj_w, fused_out, 1, 1, 0, 0, 1, 1);
     mo = ggml_add(ctx0, mo, ggml_reshape_4d(ctx0, model.mem_enc.out_proj_b, 1, 1, MD, 1));
     mo = ggml_cont(ctx0, ggml_permute(ctx0, mo, 1, 2, 0, 3));
     ggml_set_name(mo, "mem_out");
     ggml_set_output(mo);
 
-    auto* g = ggml_new_graph_custom(ctx0, 16384, false);
+    g = ggml_new_graph_custom(ctx0, 16384, false);
     ggml_build_forward_expand(g, mo);
     SAM3_TIME_END(mem_encoder_build_ms, _t_mem_build);
 
     // RFD 0011 U0: gallocr reserve+alloc region (mem_encoder_alloc_ms).
     SAM3_TIME_BEGIN(_t_mem_alloc);
-    auto* ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!ggml_gallocr_reserve(ga, g) || !ggml_gallocr_alloc_graph(ga, g)) {
         ggml_gallocr_free(ga);
         ggml_free(ctx0);
@@ -13217,14 +13318,24 @@ static bool sam3_encode_memory(
     }
     SAM3_TIME_END(mem_encoder_alloc_ms, _t_mem_alloc);
 
+    if (use_mgc) {
+        mgc.ctx = ctx0; mgc.graph = g; mgc.galloc = ga; mgc.key = mkey;
+        mgc.in[0] = mask_in; mgc.in[1] = pix_in_raw; mgc.out[0] = mo;
+    }
+    }  // end build path (mgc_hit skips straight to the input uploads)
+
     ggml_backend_tensor_set(mask_in, m_interp.data(), 0, m_interp.size() * sizeof(float));
     // Copy pixel features from state tensor to fresh input (transport driver)
     sam3_stage_feed(model.transport, state.neck_trk[2], pix_in_raw, "mem_pix_feat");
     // RFD 0011 U0: backend compute of the memory encoder (mem_encoder_compute_ms).
     SAM3_TIME_BEGIN(_t_mem_compute);
     if (!sam3_graph_compute(model.backend, g, 4)) {
-        ggml_gallocr_free(ga);
-        ggml_free(ctx0);
+        if (use_mgc) {
+            sam3_stage_gcache_release(mgc);  // never keep a wedged graph
+        } else {
+            ggml_gallocr_free(ga);
+            ggml_free(ctx0);
+        }
         return false;
     }
     SAM3_TIME_END(mem_encoder_compute_ms, _t_mem_compute);
@@ -13281,8 +13392,7 @@ static bool sam3_encode_memory(
                                         device_chain ? &tracker : nullptr)) {
             fprintf(stderr, "%s: perceiver forward failed\n", __func__);
             SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
-            ggml_gallocr_free(ga);
-            ggml_free(ctx0);
+            if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
             return false;
         }
 
@@ -13335,8 +13445,7 @@ static bool sam3_encode_memory(
         if (!sam3_acquire_slot_pair(tracker, model, MD, N_perc, 1, &st, &spe, &slot_buf)) {
             fprintf(stderr, "%s: slot pair alloc failed\n", __func__);
             SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
-            ggml_gallocr_free(ga);
-            ggml_free(ctx0);
+            if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
             return false;
         }
         ggml_backend_tensor_set(st, perc_latents.data(), 0, MD * N_perc * sizeof(float));
@@ -13369,8 +13478,7 @@ static bool sam3_encode_memory(
             }
         }
         SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
-        ggml_gallocr_free(ga);
-        ggml_free(ctx0);
+        if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
         return true;
     }
 
@@ -13382,8 +13490,7 @@ static bool sam3_encode_memory(
     if (!sam3_acquire_slot_pair(tracker, model, MD, H, H, &st, &spe, &slot_buf)) {
         fprintf(stderr, "%s: slot pair alloc failed\n", __func__);
         SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
-        ggml_gallocr_free(ga);
-        ggml_free(ctx0);
+        if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
         return false;
     }
     ggml_backend_tensor_set(st, md.data(), 0, md.size() * sizeof(float));
@@ -13420,8 +13527,7 @@ static bool sam3_encode_memory(
         }
     }
     SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
-    ggml_gallocr_free(ga);
-    ggml_free(ctx0);
+    if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
     return true;
 }
 
@@ -13851,9 +13957,12 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     tracker.slot_free.clear();
     tracker.ptr_free.clear();
     tracker.ptr_host.clear();
-    // Increment 6: drop the cached stage graph (its leaves may reference
-    // dims tied to the old session; it rebuilds on the next device frame).
+    // Increment 6: drop the cached stage graphs (their leaves may reference
+    // dims tied to the old session; they rebuild on the next device frame).
     sam3_prop_gcache_release(tracker.gc_prop);
+    sam3_stage_gcache_release(tracker.gc_memenc);
+    sam3_stage_gcache_release(tracker.gc_perc1);
+    sam3_stage_gcache_release(tracker.gc_perc2);
     if (tracker.ctx) {
         ggml_free(tracker.ctx);
         tracker.ctx = nullptr;
