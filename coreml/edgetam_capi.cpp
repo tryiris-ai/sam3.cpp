@@ -226,8 +226,11 @@ extern "C" int edgetam_capi_encode_slot(edgetam_tracker_t h, int slot,
                                      t->neck[slot][2].data()) ? 1 : 0;
 #else
         // ggml encoder-ahead (CUDA): preprocess + encode on the producer's own
-        // backend instance; write the 3 neck levels into this slot's buffers.
+        // backend instance. Device transport keeps the neck in per-slot DEVICE
+        // tensors (zero PCIe); host transport writes this slot's float buffers.
         sam3_image img = make_image(rgb, w, hgt);
+        if (sam3_encoder_ahead_encode_dev(t->ggml_ea, *t->model, img, slot))
+            return 1;
         return sam3_encoder_ahead_encode(t->ggml_ea, *t->model, img,
                                          t->neck[slot][0].data(),
                                          t->neck[slot][1].data(),
@@ -250,9 +253,13 @@ extern "C" et_result edgetam_capi_track_slot(edgetam_tracker_t h, int slot,
         // The seam is backend-agnostic — the slot was filled by the CoreML
         // producer OR the ggml-CUDA encoder-ahead producer.
         if (t->prod_enc || t->ggml_ea) {
-            sam3_coreml_set_prefetched_neck(t->neck[slot][0].data(),
-                                            t->neck[slot][1].data(),
-                                            t->neck[slot][2].data());
+            // Prefer the device-resident seam (slot filled by encode_dev);
+            // fall back to the host-float seam for CoreML / host transport.
+            if (!(t->ggml_ea && sam3_set_prefetched_neck_dev(t->ggml_ea, slot))) {
+                sam3_coreml_set_prefetched_neck(t->neck[slot][0].data(),
+                                                t->neck[slot][1].data(),
+                                                t->neck[slot][2].data());
+            }
         }
         sam3_image img = make_image(rgb, w, hgt);
         sam3_result res = sam3_propagate_frame(*t->tracker, *t->state, *t->model, img);

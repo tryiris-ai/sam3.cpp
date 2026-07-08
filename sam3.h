@@ -398,6 +398,15 @@ bool                sam3_encoder_ahead_encode(sam3_encoder_ahead* ea, const sam3
                                               float* neck0, float* neck1, float* neck2);
 void                sam3_encoder_ahead_destroy(sam3_encoder_ahead* ea);
 
+// Device-resident encoder-ahead seam (CUDA device transport only): the
+// producer encodes into per-slot persistent DEVICE tensors and the consumer
+// D2D-copies them into state — no 2×84 MB host round trip per frame. Both
+// return false when unavailable (host transport, non-CUDA build, bad slot,
+// slot not device-filled); callers then fall back to the host-float seam.
+bool sam3_encoder_ahead_encode_dev(sam3_encoder_ahead* ea, const sam3_model& model,
+                                   const sam3_image& image, int slot);
+bool sam3_set_prefetched_neck_dev(sam3_encoder_ahead* ea, int slot);
+
 /*****************************************************************************
 ** Test and Debug API
 **

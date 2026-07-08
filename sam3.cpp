@@ -5449,6 +5449,12 @@ static void edgetam_build_repvit_graph(struct ggml_context* ctx,
 static std::vector<float> s_prefetch_neck[3];
 static bool s_prefetch_ready = false;
 
+// Device-resident prefetch seam (CUDA device transport): the producer's
+// per-slot persistent DEVICE tensors, handed to the consumer as pointers —
+// the consumer D2D-copies them into state.neck_trk instead of round-tripping
+// 2×84 MB of floats through the host. Same SPSC discipline as the host seam.
+static struct { struct ggml_tensor* n[3]; bool ready; } s_prefetch_dev = {{nullptr, nullptr, nullptr}, false};
+
 void sam3_coreml_set_prefetched_neck(const float* n0, const float* n1, const float* n2) {
     const int Wd[3] = {256, 128, 64}, D = 256;
     const float* src[3] = {n0, n1, n2};
@@ -5604,6 +5610,28 @@ static bool edgetam_encode_image(sam3_state& state,
     // frame's neck into the prefetch seam. Load it into state and skip the whole
     // in-line encoder graph, mirroring the CoreML prefetch path above. Guarded to
     // the seam's fixed EdgeTAM@1024 contract (levels 256/128/64).
+    // Device-resident prefetch (increment 7): the producer already encoded
+    // this frame's neck into per-slot DEVICE tensors — three same-GPU D2D
+    // copies into state and the whole in-line encoder is skipped, with zero
+    // PCIe traffic. Requires the state buffers to exist (always true after
+    // the synchronous seed frame); otherwise falls through to the sync path.
+    if (s_prefetch_dev.ready && hp.is_edgetam() && img_size == 1024 &&
+        model.transport.kind == SAM3_TRANSPORT_DEVICE) {
+        s_prefetch_dev.ready = false;
+        bool ok = state.buffer && state.pe_buf;
+        for (int i = 0; ok && i < 3; ++i)
+            ok = state.neck_trk[i] && s_prefetch_dev.n[i] &&
+                 ggml_nbytes(state.neck_trk[i]) == ggml_nbytes(s_prefetch_dev.n[i]);
+        if (ok) {
+            SAM3_TIME_SCOPE(state_update_ms);
+            for (int i = 0; i < 3; ++i)
+                sam3_stage_feed(model.transport, s_prefetch_dev.n[i],
+                                state.neck_trk[i], "ea_neck");
+            return true;
+        }
+        fprintf(stderr, "%s: device prefetch present but state not primed — sync encode\n", __func__);
+    }
+
     if (s_prefetch_ready && hp.is_edgetam() && img_size == 1024) {
         static std::vector<float> nbuf[3];  // consumer-thread-only (SPSC seam)
         for (int i = 0; i < 3; ++i) nbuf[i].swap(s_prefetch_neck[i]);
@@ -5866,6 +5894,19 @@ static bool edgetam_encode_image(sam3_state& state,
 struct sam3_encoder_ahead {
     ggml_backend_t backend = nullptr;  // producer-owned second backend instance
     ggml_gallocr_t galloc  = nullptr;  // producer-owned graph allocator
+
+    // Device seam (increment 7): cached producer graph (addendum-4 contract —
+    // built once, recomputed in place; stable pointers let the producer's own
+    // stream reach CUDA-graph replay) + per-slot persistent neck tensors.
+    static const int SLOTS = 3;        // == EtTracker::POOL
+    struct ggml_context*  gctx  = nullptr;
+    struct ggml_cgraph*   graph = nullptr;
+    struct ggml_tensor*   inp   = nullptr;
+    struct ggml_tensor*   fpn[3] = {};
+    struct ggml_context*  slot_ctx = nullptr;
+    ggml_backend_buffer_t slot_buf = nullptr;
+    struct ggml_tensor*   slot_n[SLOTS][3] = {};
+    bool                  slot_filled[SLOTS] = {};
 };
 
 sam3_encoder_ahead* sam3_encoder_ahead_create(const sam3_model& model) {
@@ -5938,8 +5979,84 @@ bool sam3_encoder_ahead_encode(sam3_encoder_ahead* ea, const sam3_model& model,
     return ok;
 }
 
+// Device-seam producer (increment 7): encode on the producer instance with a
+// CACHED graph, then same-instance async D2D into this slot's persistent neck
+// tensors + one producer-stream sync so the writes are complete before the Go
+// channel signals the consumer (happens-before across threads).
+bool sam3_encoder_ahead_encode_dev(sam3_encoder_ahead* ea, const sam3_model& model,
+                                   const sam3_image& image, int slot) {
+#ifdef GGML_USE_CUDA
+    if (!ea || !ea->backend || slot < 0 || slot >= sam3_encoder_ahead::SLOTS) return false;
+    if (model.transport.kind != SAM3_TRANSPORT_DEVICE) return false;
+    const int img_size = 1024;  // the prefetch seam's fixed EdgeTAM contract
+
+    std::vector<float> img_data = sam2_preprocess_image(image, img_size);
+
+    if (!ea->graph) {
+        const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        ea->gctx = ggml_init(gparams);
+        if (!ea->gctx) return false;
+        ea->inp = ggml_new_tensor_4d(ea->gctx, GGML_TYPE_F32, img_size, img_size, 3, 1);
+        ggml_set_name(ea->inp, "input_image");
+        ggml_set_input(ea->inp);
+        struct ggml_tensor* stage_outs[4] = {};
+        edgetam_build_repvit_graph(ea->gctx, ea->inp, model, stage_outs);
+        struct ggml_tensor* fpn_outs[4] = {};
+        edgetam_build_fpn_neck_graph(ea->gctx, stage_outs, model, fpn_outs);
+        for (int i = 0; i < 3; ++i) { ggml_set_output(fpn_outs[i]); ea->fpn[i] = fpn_outs[i]; }
+        ea->graph = ggml_new_graph_custom(ea->gctx, 32768, false);
+        for (int i = 0; i < 3; ++i) ggml_build_forward_expand(ea->graph, ea->fpn[i]);
+        if (!ggml_gallocr_alloc_graph(ea->galloc, ea->graph)) {
+            ggml_free(ea->gctx); ea->gctx = nullptr; ea->graph = nullptr;
+            return false;
+        }
+        // Per-slot persistent neck tensors: one ctx + one buffer for all slots.
+        struct ggml_init_params sp = {ggml_tensor_overhead() * 16, nullptr, true};
+        ea->slot_ctx = ggml_init(sp);
+        for (int s = 0; s < sam3_encoder_ahead::SLOTS; ++s)
+            for (int i = 0; i < 3; ++i)
+                ea->slot_n[s][i] = ggml_dup_tensor(ea->slot_ctx, ea->fpn[i]);
+        ea->slot_buf = ggml_backend_alloc_ctx_tensors(ea->slot_ctx, ea->backend);
+        if (!ea->slot_buf) {
+            if (ea->slot_ctx) { ggml_free(ea->slot_ctx); ea->slot_ctx = nullptr; }
+            ggml_free(ea->gctx); ea->gctx = nullptr; ea->graph = nullptr;
+            return false;
+        }
+        fprintf(stderr, "%s: device-resident encoder-ahead seam active (%d slots)\n",
+                __func__, sam3_encoder_ahead::SLOTS);
+    }
+
+    ggml_backend_tensor_set(ea->inp, img_data.data(), 0, img_data.size() * sizeof(float));
+    if (!sam3_graph_compute(ea->backend, ea->graph, 4)) return false;
+    for (int i = 0; i < 3; ++i)
+        ggml_backend_tensor_copy_async(ea->backend, ea->backend, ea->fpn[i], ea->slot_n[slot][i]);
+    ggml_backend_synchronize(ea->backend);
+    ea->slot_filled[slot] = true;
+    return true;
+#else
+    (void)ea; (void)model; (void)image; (void)slot;
+    return false;
+#endif
+}
+
+// Consumer side of the device seam: stash this slot's device tensors for
+// edgetam_encode_image's device-prefetch branch (consumer thread only, SPSC).
+bool sam3_set_prefetched_neck_dev(sam3_encoder_ahead* ea, int slot) {
+    if (!ea || slot < 0 || slot >= sam3_encoder_ahead::SLOTS || !ea->slot_filled[slot])
+        return false;
+    ea->slot_filled[slot] = false;
+    for (int i = 0; i < 3; ++i) s_prefetch_dev.n[i] = ea->slot_n[slot][i];
+    s_prefetch_dev.ready = true;
+    return true;
+}
+
 void sam3_encoder_ahead_destroy(sam3_encoder_ahead* ea) {
     if (!ea) return;
+    s_prefetch_dev.ready = false;
+    if (ea->slot_buf) ggml_backend_buffer_free(ea->slot_buf);
+    if (ea->slot_ctx) ggml_free(ea->slot_ctx);
+    if (ea->gctx)     ggml_free(ea->gctx);
     if (ea->galloc)  ggml_gallocr_free(ea->galloc);
     if (ea->backend) ggml_backend_free(ea->backend);
     delete ea;
