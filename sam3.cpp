@@ -1060,6 +1060,59 @@ static void sam3_stagebuf_push(const sam3_transport& tr, sam3_stagebuf& sb,
     ggml_backend_tensor_copy_async(tr.backend, tr.backend, sb.dev, dst);
 }
 
+// Increment 6 (CLAUDE.md graph-isolation addendum 4): a stage's cached
+// ggml_context + cgraph + gallocr, kept alive across frames on the CUDA
+// device driver and recomputed in place. Keyed on every topology-affecting
+// shape/config; released + rebuilt on any key change. Stable node/leaf data
+// pointers are what let ggml-CUDA's graph capture reach steady replay, and
+// keeping the gallocr kills the per-frame cudaMalloc/free churn. The host
+// driver never touches these — it keeps the verbatim build→compute→free.
+struct sam3_prop_gcache {
+    struct ggml_context* ctx    = nullptr;
+    struct ggml_cgraph*  graph  = nullptr;
+    struct ggml_gallocr* galloc = nullptr;
+    uint64_t             key    = 0;
+    // input leaves (subset used depends on the cached configuration)
+    struct ggml_tensor *curr_in = nullptr, *src_pos = nullptr,
+                       *prompt = nullptr, *prompt_pos = nullptr,
+                       *rope_q = nullptr, *rope_k = nullptr,
+                       *sparse = nullptr, *image_pe = nullptr, *dense = nullptr,
+                       *trk_s0 = nullptr, *trk_s1 = nullptr,
+                       *tpos = nullptr, *ptr = nullptr, *ptr_pos = nullptr,
+                       *slot_feat[16] = {}, *slot_pe[16] = {};
+    // outputs
+    struct ggml_tensor *masks = nullptr, *iou = nullptr, *obj = nullptr,
+                       *sam_token = nullptr, *mask_tokens = nullptr;
+};
+
+static void sam3_prop_gcache_release(sam3_prop_gcache& gc) {
+    if (gc.galloc) ggml_gallocr_free(gc.galloc);
+    if (gc.ctx) ggml_free(gc.ctx);
+    gc = sam3_prop_gcache();
+}
+
+// Generic small-stage cache (same addendum-4 contract as sam3_prop_gcache)
+// for stages with few leaves: image encoder, memory encoder, perceiver 1D/2D.
+struct sam3_stage_gcache {
+    struct ggml_context* ctx    = nullptr;
+    struct ggml_cgraph*  graph  = nullptr;
+    struct ggml_gallocr* galloc = nullptr;
+    uint64_t             key    = 0;
+    struct ggml_tensor*  in[3]  = {};
+    struct ggml_tensor*  out[4] = {};  // encoder has 4 FPN outputs
+};
+
+static void sam3_stage_gcache_release(sam3_stage_gcache& gc) {
+    if (gc.galloc) ggml_gallocr_free(gc.galloc);
+    if (gc.ctx) ggml_free(gc.ctx);
+    gc = sam3_stage_gcache();
+}
+
+// FNV-style mix for graph-cache keys.
+static inline void sam3_key_mix(uint64_t& k, uint64_t v) {
+    k ^= v + 0x9e3779b97f4a7c15ull + (k << 6) + (k >> 2);
+}
+
 // Resolved once at model load, after the backend chain (Metal>CUDA>Vulkan>CPU).
 // Default host on every backend; device only when explicitly requested AND the
 // answered backend is CUDA — Metal can never pass this gate, so the mac cannot
@@ -1203,6 +1256,9 @@ struct sam3_state {
     // sam3_populate_pe_cache actually recomputes). Freed in sam3_free_state.
     uint64_t     pe_cache_gen = 0;
     sam3_stagebuf tw_sparse, tw_image_pe, tw_dense;
+
+    // Increment 6c: cached image-encoder stage graph (device driver only).
+    sam3_stage_gcache gc_encoder;
 };
 
 /*
@@ -1236,59 +1292,6 @@ struct sam3_masklet {
     int         degrade_count = 0;  // consecutive degraded (weak) frames in AT_RISK
     int         occl_count    = 0;  // consecutive absent frames in OCCLUDED
 };
-
-// Increment 6 (CLAUDE.md graph-isolation addendum 4): a stage's cached
-// ggml_context + cgraph + gallocr, kept alive across frames on the CUDA
-// device driver and recomputed in place. Keyed on every topology-affecting
-// shape/config; released + rebuilt on any key change. Stable node/leaf data
-// pointers are what let ggml-CUDA's graph capture reach steady replay, and
-// keeping the gallocr kills the per-frame cudaMalloc/free churn. The host
-// driver never touches these — it keeps the verbatim build→compute→free.
-struct sam3_prop_gcache {
-    struct ggml_context* ctx    = nullptr;
-    struct ggml_cgraph*  graph  = nullptr;
-    struct ggml_gallocr* galloc = nullptr;
-    uint64_t             key    = 0;
-    // input leaves (subset used depends on the cached configuration)
-    struct ggml_tensor *curr_in = nullptr, *src_pos = nullptr,
-                       *prompt = nullptr, *prompt_pos = nullptr,
-                       *rope_q = nullptr, *rope_k = nullptr,
-                       *sparse = nullptr, *image_pe = nullptr, *dense = nullptr,
-                       *trk_s0 = nullptr, *trk_s1 = nullptr,
-                       *tpos = nullptr, *ptr = nullptr, *ptr_pos = nullptr,
-                       *slot_feat[16] = {}, *slot_pe[16] = {};
-    // outputs
-    struct ggml_tensor *masks = nullptr, *iou = nullptr, *obj = nullptr,
-                       *sam_token = nullptr, *mask_tokens = nullptr;
-};
-
-static void sam3_prop_gcache_release(sam3_prop_gcache& gc) {
-    if (gc.galloc) ggml_gallocr_free(gc.galloc);
-    if (gc.ctx) ggml_free(gc.ctx);
-    gc = sam3_prop_gcache();
-}
-
-// Generic small-stage cache (same addendum-4 contract as sam3_prop_gcache)
-// for stages with few leaves: memory encoder, perceiver 1D/2D sub-graphs.
-struct sam3_stage_gcache {
-    struct ggml_context* ctx    = nullptr;
-    struct ggml_cgraph*  graph  = nullptr;
-    struct ggml_gallocr* galloc = nullptr;
-    uint64_t             key    = 0;
-    struct ggml_tensor*  in[3]  = {};
-    struct ggml_tensor*  out[1] = {};
-};
-
-static void sam3_stage_gcache_release(sam3_stage_gcache& gc) {
-    if (gc.galloc) ggml_gallocr_free(gc.galloc);
-    if (gc.ctx) ggml_free(gc.ctx);
-    gc = sam3_stage_gcache();
-}
-
-// FNV-style mix for graph-cache keys.
-static inline void sam3_key_mix(uint64_t& k, uint64_t v) {
-    k ^= v + 0x9e3779b97f4a7c15ull + (k << 6) + (k >> 2);
-}
 
 struct sam3_memory_slot {
     struct ggml_tensor* spatial_feats  = nullptr;  // [64, 72, 72]
@@ -3974,10 +3977,11 @@ void sam3_state_set_orig_dims(sam3_state& state, int w, int h) {
 }
 
 void sam3_free_state(sam3_state& state) {
-    // Stage-transport twins (increment 2)
+    // Stage-transport twins (increment 2) + cached encoder graph (increment 6c)
     sam3_stagebuf_release(state.tw_sparse);
     sam3_stagebuf_release(state.tw_image_pe);
     sam3_stagebuf_release(state.tw_dense);
+    sam3_stage_gcache_release(state.gc_encoder);
     if (state.galloc) {
         ggml_gallocr_free(state.galloc);
         state.galloc = nullptr;
@@ -5624,6 +5628,24 @@ static bool edgetam_encode_image(sam3_state& state,
     struct ggml_tensor* inp = nullptr;
     int n_fpn = 4 - hp.scalp;
     struct ggml_tensor* fpn_outs[4] = {};
+    struct ggml_gallocr* galloc = nullptr;
+
+    // Increment 6c: cached encoder graph (CLAUDE.md addendum 4) — the biggest
+    // per-frame graph; fixed shapes at a given img_size, so steady state hits
+    // every frame and ggml-CUDA graph capture sees stable pointers.
+    const bool use_egc = model.transport.kind == SAM3_TRANSPORT_DEVICE;
+    uint64_t ekey = 1469598103934665603ull;
+    sam3_key_mix(ekey, (uint64_t)img_size);
+    sam3_key_mix(ekey, (uint64_t)n_fpn);
+    auto& egc = state.gc_encoder;
+    const bool egc_hit = use_egc && egc.ctx && egc.key == ekey;
+    if (use_egc && !egc_hit && egc.ctx) sam3_stage_gcache_release(egc);
+
+    if (egc_hit) {
+        ctx0 = egc.ctx; graph = egc.graph; galloc = egc.galloc;
+        inp = egc.in[0];
+        for (int i = 0; i < 4; ++i) fpn_outs[i] = egc.out[i];
+    } else {
     {
         SAM3_TIME_SCOPE(image_encoder_build_ms);
         const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
@@ -5667,7 +5689,7 @@ static bool edgetam_encode_image(sam3_state& state,
     // ── Allocate ─────────────────────────────────────────────────────────
     // RFD 0011 U0: gallocr reserve+alloc region (image_encoder_alloc_ms),
     // separate from build and compute. U1 reuses a pre-reserved allocator here.
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     {
         SAM3_TIME_SCOPE(image_encoder_alloc_ms);
         if (!ggml_gallocr_reserve(galloc, graph)) {
@@ -5684,6 +5706,13 @@ static bool edgetam_encode_image(sam3_state& state,
         }
     }
 
+    if (use_egc) {
+        egc.ctx = ctx0; egc.graph = graph; egc.galloc = galloc; egc.key = ekey;
+        egc.in[0] = inp;
+        for (int i = 0; i < 4; ++i) egc.out[i] = fpn_outs[i];
+    }
+    }  // end build path (egc_hit skips straight to the input upload)
+
     // Set input image
     ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
 
@@ -5694,8 +5723,12 @@ static bool edgetam_encode_image(sam3_state& state,
         SAM3_TIME_SCOPE(image_encoder_compute_ms);
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
             fprintf(stderr, "%s: graph compute failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
+            if (use_egc) {
+                sam3_stage_gcache_release(egc);  // never keep a wedged graph
+            } else {
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx0);
+            }
             return false;
         }
     }
@@ -5796,8 +5829,10 @@ static bool edgetam_encode_image(sam3_state& state,
         }
     }
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
+    if (!use_egc) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+    }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
