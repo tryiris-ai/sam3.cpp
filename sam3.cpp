@@ -1237,6 +1237,42 @@ struct sam3_masklet {
     int         occl_count    = 0;  // consecutive absent frames in OCCLUDED
 };
 
+// Increment 6 (CLAUDE.md graph-isolation addendum 4): a stage's cached
+// ggml_context + cgraph + gallocr, kept alive across frames on the CUDA
+// device driver and recomputed in place. Keyed on every topology-affecting
+// shape/config; released + rebuilt on any key change. Stable node/leaf data
+// pointers are what let ggml-CUDA's graph capture reach steady replay, and
+// keeping the gallocr kills the per-frame cudaMalloc/free churn. The host
+// driver never touches these — it keeps the verbatim build→compute→free.
+struct sam3_prop_gcache {
+    struct ggml_context* ctx    = nullptr;
+    struct ggml_cgraph*  graph  = nullptr;
+    struct ggml_gallocr* galloc = nullptr;
+    uint64_t             key    = 0;
+    // input leaves (subset used depends on the cached configuration)
+    struct ggml_tensor *curr_in = nullptr, *src_pos = nullptr,
+                       *prompt = nullptr, *prompt_pos = nullptr,
+                       *rope_q = nullptr, *rope_k = nullptr,
+                       *sparse = nullptr, *image_pe = nullptr, *dense = nullptr,
+                       *trk_s0 = nullptr, *trk_s1 = nullptr,
+                       *tpos = nullptr, *ptr = nullptr, *ptr_pos = nullptr,
+                       *slot_feat[16] = {}, *slot_pe[16] = {};
+    // outputs
+    struct ggml_tensor *masks = nullptr, *iou = nullptr, *obj = nullptr,
+                       *sam_token = nullptr, *mask_tokens = nullptr;
+};
+
+static void sam3_prop_gcache_release(sam3_prop_gcache& gc) {
+    if (gc.galloc) ggml_gallocr_free(gc.galloc);
+    if (gc.ctx) ggml_free(gc.ctx);
+    gc = sam3_prop_gcache();
+}
+
+// FNV-style mix for graph-cache keys.
+static inline void sam3_key_mix(uint64_t& k, uint64_t v) {
+    k ^= v + 0x9e3779b97f4a7c15ull + (k << 6) + (k >> 2);
+}
+
 struct sam3_memory_slot {
     struct ggml_tensor* spatial_feats  = nullptr;  // [64, 72, 72]
     struct ggml_tensor* spatial_pe     = nullptr;  // [64, 72, 72]
@@ -1347,6 +1383,9 @@ struct sam3_tracker {
     // instead of doing 16 per-frame 1 KB D2H gets. The values pass through the
     // host at store time anyway, so this costs one memcpy per credible frame.
     std::map<int, std::vector<std::vector<float>>> ptr_host;
+
+    // Increment 6: cached propagate (mem-attn + decoder) stage graph.
+    sam3_prop_gcache gc_prop;
 };
 
 // Increment 3: acquire a bank-slot tensor pair (feats + pe sharing one backend
@@ -12499,10 +12538,33 @@ static sam3_prop_output sam3_propagate_single(
     // stays 0 and the combined compute lands in mem_attn_compute_ms. U1 reuses
     // this graph across frames, which should drive build_ms+alloc_ms → 0.
     SAM3_TIME_BEGIN(_t_prop_build);
-    const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
-    struct ggml_init_params gparams = {buf_size, nullptr, true};
-    auto* ctx0 = ggml_init(gparams);
-    if (!ctx0) return output;
+    // Increment 6 (CLAUDE.md addendum 4): on the CUDA device driver, reuse the
+    // stage graph across frames when every topology-affecting input matches.
+    // Ramp frames (growing M_total) miss the key and rebuild; steady state
+    // hits every frame — no rebuild, no gallocr realloc, stable leaf pointers
+    // (the precondition for ggml-CUDA graph replay).
+    const bool use_gcache = model.transport.kind == SAM3_TRANSPORT_DEVICE && !use_cml_ma;
+    uint64_t gkey = 1469598103934665603ull;
+    sam3_key_mix(gkey, (uint64_t)H);
+    sam3_key_mix(gkey, (uint64_t)pd.M_total);
+    sam3_key_mix(gkey, (uint64_t)pd.num_obj_ptr_tokens);
+    sam3_key_mix(gkey, (uint64_t)pd.M_spatial);
+    sam3_key_mix(gkey, device_prompt ? (uint64_t)n_sel : 0ull);
+    sam3_key_mix(gkey, device_prompt ? 2ull : 1ull);
+    sam3_key_mix(gkey, (uint64_t)N_per_slot);
+    auto& gc = tracker.gc_prop;
+    const bool gcache_hit = use_gcache && gc.ctx && gc.key == gkey;
+    if (use_gcache && !gcache_hit && gc.ctx) sam3_prop_gcache_release(gc);
+
+    struct ggml_context* ctx0 = nullptr;
+    if (gcache_hit) {
+        ctx0 = gc.ctx;
+    } else {
+        const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        ctx0 = ggml_init(gparams);
+        if (!ctx0) return output;
+    }
 
     // Memory-attention inputs (ggml path only). In the CoreML mem-attn path these
     // stay null and cond_spatial is an input tensor filled from the CoreML output.
@@ -12516,7 +12578,31 @@ static sam3_prop_output sam3_propagate_single(
     struct ggml_tensor* tpos_leaf = nullptr;
     struct ggml_tensor* ptr_leaf = nullptr, * ptr_pos_leaf = nullptr;
     struct ggml_tensor* prompt_node = nullptr, * prompt_pos_node = nullptr;
+    // Hoisted so both the build path and the cache-hit path can set them
+    struct ggml_tensor* sparse_in = nullptr, * image_pe = nullptr, * dense_emb = nullptr;
+    struct ggml_tensor* trk_s0 = nullptr, * trk_s1 = nullptr;
+    struct ggml_tensor* o_masks = nullptr, * o_iou = nullptr, * o_obj = nullptr;
+    struct ggml_tensor* o_sam = nullptr, * o_mtok = nullptr;
+    struct ggml_cgraph* graph = nullptr;
+    struct ggml_gallocr* galloc = nullptr;
+    const int H0 = H * 4, H1 = H * 2;
 
+    if (gcache_hit) {
+        // Reuse the cached stage graph in place; only the inputs change.
+        graph = gc.graph; galloc = gc.galloc;
+        curr_in = gc.curr_in; curr = gc.curr_in; src_pos_t = gc.src_pos;
+        prompt_t = gc.prompt; prompt_pos_t = gc.prompt_pos;
+        rope_q_t = gc.rope_q; rope_k_t = gc.rope_k;
+        sparse_in = gc.sparse; image_pe = gc.image_pe; dense_emb = gc.dense;
+        trk_s0 = gc.trk_s0; trk_s1 = gc.trk_s1;
+        tpos_leaf = gc.tpos; ptr_leaf = gc.ptr; ptr_pos_leaf = gc.ptr_pos;
+        for (int i = 0; i < 16; ++i) {
+            slot_feat_leaf[i] = gc.slot_feat[i];
+            slot_pe_leaf[i]   = gc.slot_pe[i];
+        }
+        o_masks = gc.masks; o_iou = gc.iou; o_obj = gc.obj;
+        o_sam = gc.sam_token; o_mtok = gc.mask_tokens;
+    } else {
     if (use_cml_ma) {
         // CoreML produced the attended features; inject them as a decoder input.
         cond_spatial = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
@@ -12603,22 +12689,21 @@ static sam3_prop_output sam3_propagate_single(
     }
 
     // Bug 3 fix: single not_a_point_embed token instead of empty sparse
-    auto* sparse_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, 1);
+    sparse_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, 1);
     ggml_set_name(sparse_in, "prop_sparse");
     ggml_set_input(sparse_in);
 
-    auto* image_pe = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+    image_pe = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
     ggml_set_name(image_pe, "prop_pe");
     ggml_set_input(image_pe);
-    auto* dense_emb = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+    dense_emb = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
     ggml_set_name(dense_emb, "prop_dense");
     ggml_set_input(dense_emb);
 
-    const int H0 = H * 4, H1 = H * 2;
-    auto* trk_s0 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H0, H0, 1);
+    trk_s0 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H0, H0, 1);
     ggml_set_name(trk_s0, "prop_trk_s0");
     ggml_set_input(trk_s0);
-    auto* trk_s1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H1, H1, 1);
+    trk_s1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H1, H1, 1);
     ggml_set_name(trk_s1, "prop_trk_s1");
     ggml_set_input(trk_s1);
 
@@ -12631,7 +12716,7 @@ static sam3_prop_output sam3_propagate_single(
     ggml_set_output(dec.sam_token);
     if (dec.mask_tokens) ggml_set_output(dec.mask_tokens);
 
-    auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
+    graph = ggml_new_graph_custom(ctx0, 32768, false);
     ggml_build_forward_expand(graph, dec.masks);
     ggml_build_forward_expand(graph, dec.iou_pred);
     ggml_build_forward_expand(graph, dec.obj_score);
@@ -12641,13 +12726,34 @@ static sam3_prop_output sam3_propagate_single(
 
     // RFD 0011 U0: gallocr reserve+alloc region (mem_attn_alloc_ms).
     SAM3_TIME_BEGIN(_t_prop_alloc);
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return output;
     }
     SAM3_TIME_END(mem_attn_alloc_ms, _t_prop_alloc);
+
+    o_masks = dec.masks; o_iou = dec.iou_pred; o_obj = dec.obj_score;
+    o_sam = dec.sam_token; o_mtok = dec.mask_tokens;
+    if (use_gcache) {
+        // Stash the stage graph for reuse (CLAUDE.md addendum 4). Released on
+        // any key change, tracker reset, or compute failure.
+        gc.ctx = ctx0; gc.graph = graph; gc.galloc = galloc; gc.key = gkey;
+        gc.curr_in = curr_in; gc.src_pos = src_pos_t;
+        gc.prompt = prompt_t; gc.prompt_pos = prompt_pos_t;
+        gc.rope_q = rope_q_t; gc.rope_k = rope_k_t;
+        gc.sparse = sparse_in; gc.image_pe = image_pe; gc.dense = dense_emb;
+        gc.trk_s0 = trk_s0; gc.trk_s1 = trk_s1;
+        gc.tpos = tpos_leaf; gc.ptr = ptr_leaf; gc.ptr_pos = ptr_pos_leaf;
+        for (int i = 0; i < 16; ++i) {
+            gc.slot_feat[i] = slot_feat_leaf[i];
+            gc.slot_pe[i]   = slot_pe_leaf[i];
+        }
+        gc.masks = o_masks; gc.iou = o_iou; gc.obj = o_obj;
+        gc.sam_token = o_sam; gc.mask_tokens = o_mtok;
+    }
+    }  // end build path (gcache_hit skips straight to the input uploads)
 
     if (use_cml_ma) {
         // Inject the CoreML mem-attn output as the decoder's conditioned input.
@@ -12724,8 +12830,12 @@ static sam3_prop_output sam3_propagate_single(
     // because the decoder is fused into this same graph on the EdgeTAM path).
     SAM3_TIME_BEGIN(_t_prop_compute);
     if (!sam3_graph_compute(model.backend, graph, 4)) {
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
+        if (use_gcache) {
+            sam3_prop_gcache_release(gc);  // never keep a wedged graph
+        } else {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+        }
         return output;
     }
     SAM3_TIME_END(mem_attn_compute_ms, _t_prop_compute);
@@ -12740,7 +12850,7 @@ static sam3_prop_output sam3_propagate_single(
     if (use_multimask) {
         // Read all 4 IoU predictions
         std::vector<float> all_ious(num_mask_tokens);
-        ggml_backend_tensor_get(dec.iou_pred, all_ious.data(), 0, num_mask_tokens * sizeof(float));
+        ggml_backend_tensor_get(o_iou, all_ious.data(), 0, num_mask_tokens * sizeof(float));
 
         // Multimask uses mask tokens 1-3 (skip token 0 which is the single-mask output)
         int best_idx = 1;
@@ -12754,35 +12864,37 @@ static sam3_prop_output sam3_propagate_single(
         output.mask_w = mhw;
         output.mask_logits.resize(mhw * mhw);
         // Read best mask (offset by best_idx * mhw * mhw)
-        ggml_backend_tensor_get(dec.masks, output.mask_logits.data(),
+        ggml_backend_tensor_get(o_masks, output.mask_logits.data(),
                                 best_idx * mhw * mhw * sizeof(float), mhw * mhw * sizeof(float));
         output.iou_scores.resize(1);
         output.iou_scores[0] = best_iou;
-        ggml_backend_tensor_get(dec.obj_score, &output.obj_score, 0, sizeof(float));
+        ggml_backend_tensor_get(o_obj, &output.obj_score, 0, sizeof(float));
 
         // Object pointer token: use best multimask token if use_multimask_token_for_obj_ptr
         output.sam_token.resize(D);
-        if (hp.use_multimask_token_for_obj_ptr && dec.mask_tokens) {
-            ggml_backend_tensor_get(dec.mask_tokens, output.sam_token.data(),
+        if (hp.use_multimask_token_for_obj_ptr && o_mtok) {
+            ggml_backend_tensor_get(o_mtok, output.sam_token.data(),
                                     best_idx * D * sizeof(float), D * sizeof(float));
         } else {
-            ggml_backend_tensor_get(dec.sam_token, output.sam_token.data(), 0, D * sizeof(float));
+            ggml_backend_tensor_get(o_sam, output.sam_token.data(), 0, D * sizeof(float));
         }
     } else {
         output.n_masks = 1;
         output.mask_h = mhw;
         output.mask_w = mhw;
         output.mask_logits.resize(mhw * mhw);
-        ggml_backend_tensor_get(dec.masks, output.mask_logits.data(), 0, mhw * mhw * sizeof(float));
+        ggml_backend_tensor_get(o_masks, output.mask_logits.data(), 0, mhw * mhw * sizeof(float));
         output.iou_scores.resize(1);
-        ggml_backend_tensor_get(dec.iou_pred, output.iou_scores.data(), 0, sizeof(float));
-        ggml_backend_tensor_get(dec.obj_score, &output.obj_score, 0, sizeof(float));
+        ggml_backend_tensor_get(o_iou, output.iou_scores.data(), 0, sizeof(float));
+        ggml_backend_tensor_get(o_obj, &output.obj_score, 0, sizeof(float));
         output.sam_token.resize(D);
-        ggml_backend_tensor_get(dec.sam_token, output.sam_token.data(), 0, D * sizeof(float));
+        ggml_backend_tensor_get(o_sam, output.sam_token.data(), 0, D * sizeof(float));
     }
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
+    if (!use_gcache) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+    }
     return output;
 }
 
@@ -13739,6 +13851,9 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     tracker.slot_free.clear();
     tracker.ptr_free.clear();
     tracker.ptr_host.clear();
+    // Increment 6: drop the cached stage graph (its leaves may reference
+    // dims tied to the old session; it rebuilds on the next device frame).
+    sam3_prop_gcache_release(tracker.gc_prop);
     if (tracker.ctx) {
         ggml_free(tracker.ctx);
         tracker.ctx = nullptr;
