@@ -1315,6 +1315,9 @@ struct sam3_tracker {
     // change, so pe_gen keys it too. Freed with owned_buffers on reset.
     uint64_t     pe_gen = 0;
     sam3_stagebuf tw_rope_q, tw_rope_k, tw_src_pos;
+    // Increment 4: perceiver-input twins (pos = cached_sinpe_64 keyed on
+    // pe_gen; latents are immutable weights, gen fixed at 1)
+    sam3_stagebuf tw_perc_pos, tw_perc_lat1, tw_perc_lat2;
 
     // Increment 3: recycling free-lists for bank-slot / obj-ptr device tensors.
     // Evicted slots return their tensor pair + buffer here; the next store
@@ -6462,7 +6465,14 @@ static bool edgetam_perceiver_forward(
         const std::vector<float>& mem_pos,        // [64 * H * W]
         int H, int W,
         std::vector<float>& out_latents,          // output: [512 * 64]
-        std::vector<float>& out_pos) {            // output: [512 * 64]
+        std::vector<float>& out_pos,              // output: [512 * 64]
+        // Increment 4 (device transport): when set, feed the memory features
+        // by same-backend D2D from this live memenc output tensor instead of
+        // uploading `mem_features` (which may then be empty), and route the 2D
+        // window partition IN-GRAPH (a pure byte gather — bit-identical to
+        // edgetam_window_partition_cpu). trk supplies the input twins.
+        struct ggml_tensor* mem_features_dev = nullptr,
+        sam3_tracker* trk = nullptr) {
     auto t_start = std::chrono::high_resolution_clock::now();
 
     const auto& perc = model.perceiver;
@@ -6515,8 +6525,12 @@ static bool edgetam_perceiver_forward(
     // pos = w + h * W.
 
     // Window partition: [D, H*W] → [D, ws2, N_2d] i.e. [64, 16, 256]
-    std::vector<float> feat_windowed(D * ws2 * N_2d);
-    edgetam_window_partition_cpu(mem_features.data(), D, H, W, ws, feat_windowed.data());
+    // (host path only — the device path partitions in-graph from the leaf)
+    std::vector<float> feat_windowed;
+    if (!mem_features_dev) {
+        feat_windowed.resize((size_t)D * ws2 * N_2d);
+        edgetam_window_partition_cpu(mem_features.data(), D, H, W, ws, feat_windowed.data());
+    }
 
     // Reshape latents_2d for windowed processing: [D, N_2d] → [D, 1, N_2d]
     // Each window has exactly 1 latent token.
@@ -6543,9 +6557,22 @@ static bool edgetam_perceiver_forward(
         ggml_set_name(lat_in, "lat_1d_in");
         ggml_set_input(lat_in);
 
-        auto* x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
-        ggml_set_name(x_in, "feat_1d_in");
-        ggml_set_input(x_in);
+        // Device transport: the fresh leaf mirrors the memenc output's 4D
+        // layout so it can be fed by whole-tensor D2D; the graph still sees
+        // [D, HW, 1] via an in-graph reshape of the leaf (curr-fix pattern).
+        struct ggml_tensor* x4 = nullptr;
+        struct ggml_tensor* x_in = nullptr;
+        if (mem_features_dev) {
+            x4 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, mem_features_dev->ne[0],
+                                    mem_features_dev->ne[1], mem_features_dev->ne[2], 1);
+            ggml_set_name(x4, "feat_1d_in"); ggml_set_input(x4);
+            x_in = ggml_reshape_3d(ctx0, x4, D, HW, 1);
+        } else {
+            x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
+            ggml_set_name(x_in, "feat_1d_in");
+            ggml_set_input(x_in);
+            x4 = x_in;
+        }
 
         auto* pos_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
         ggml_set_name(pos_in, "pos_1d_in");
@@ -6577,13 +6604,25 @@ static bool edgetam_perceiver_forward(
             return false;
         }
 
-        // Set inputs
-        ggml_backend_tensor_set(lat_in, latents_1d_data.data(), 0,
-                                D * N_1d * sizeof(float));
-        ggml_backend_tensor_set(x_in, mem_features.data(), 0,
-                                D * HW * sizeof(float));
-        ggml_backend_tensor_set(pos_in, mem_pos.data(), 0,
-                                D * HW * sizeof(float));
+        // Set inputs (device transport: latents/pos via persistent twins,
+        // features by D2D from the live memenc output — increment 4)
+        if (trk)
+            sam3_stagebuf_push(model.transport, trk->tw_perc_lat1, latents_1d_data.data(),
+                               D * N_1d * sizeof(float), lat_in, 1, "perc_lat1");
+        else
+            ggml_backend_tensor_set(lat_in, latents_1d_data.data(), 0,
+                                    D * N_1d * sizeof(float));
+        if (mem_features_dev)
+            sam3_stage_feed(model.transport, mem_features_dev, x4, "perc_feat_1d");
+        else
+            ggml_backend_tensor_set(x_in, mem_features.data(), 0,
+                                    D * HW * sizeof(float));
+        if (trk)
+            sam3_stagebuf_push(model.transport, trk->tw_perc_pos, mem_pos.data(),
+                               D * HW * sizeof(float), pos_in, trk->pe_gen, "perc_pos");
+        else
+            ggml_backend_tensor_set(pos_in, mem_pos.data(), 0,
+                                    D * HW * sizeof(float));
 
         if (!sam3_graph_compute(model.backend, graph, 4)) {
             fprintf(stderr, "%s: 1D graph compute failed\n", __func__);
@@ -6612,10 +6651,33 @@ static bool edgetam_perceiver_forward(
             return false;
         }
 
-        // Input: windowed features [D, ws2, N_2d] where batch dim = N_2d = 256
-        auto* x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, ws2, N_2d);
-        ggml_set_name(x_in, "feat_2d_in");
-        ggml_set_input(x_in);
+        // Input: windowed features [D, ws2, N_2d] where batch dim = N_2d = 256.
+        // Device transport (increment 4): the leaf mirrors the memenc output's
+        // 4D layout and the window partition happens IN-GRAPH — a pure byte
+        // gather (reshape/permute/cont), bit-identical to the CPU partition:
+        //   [D, W, H]                      x = wx*ws+ix, y = wy*ws+iy
+        //   → [D, ws, nw, H]               split x into (ix, wx)
+        //   → perm(0,1,3,2) → [D, ws, H, nw]      (d, ix, y, wx)
+        //   → [D*ws, ws, nw, nw]           split y into (iy, wy)
+        //   → perm(0,1,3,2) → [D*ws, ws, nw, nw]  (d·ix, iy, wx, wy)
+        //   → [D, ws2, N_2d]               token = iy*ws+ix, window = wy*nw+wx
+        struct ggml_tensor* x4 = nullptr;
+        struct ggml_tensor* x_in = nullptr;
+        if (mem_features_dev) {
+            x4 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, mem_features_dev->ne[0],
+                                    mem_features_dev->ne[1], mem_features_dev->ne[2], 1);
+            ggml_set_name(x4, "feat_2d_in"); ggml_set_input(x4);
+            auto* a = ggml_reshape_4d(ctx0, x4, D, ws, nw, H);
+            auto* b = ggml_cont(ctx0, ggml_permute(ctx0, a, 0, 1, 3, 2));
+            auto* c = ggml_reshape_4d(ctx0, b, D * ws, ws, nw, nw);
+            auto* dperm = ggml_cont(ctx0, ggml_permute(ctx0, c, 0, 1, 3, 2));
+            x_in = ggml_reshape_3d(ctx0, dperm, D, ws2, N_2d);
+        } else {
+            x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, ws2, N_2d);
+            ggml_set_name(x_in, "feat_2d_in");
+            ggml_set_input(x_in);
+            x4 = x_in;
+        }
 
         // Input: latents [D, 1, N_2d] — 1 latent per window
         auto* lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, N_2d);
@@ -6650,13 +6712,21 @@ static bool edgetam_perceiver_forward(
             return false;
         }
 
-        // Set windowed features
-        ggml_backend_tensor_set(x_in, feat_windowed.data(), 0,
-                                D * ws2 * N_2d * sizeof(float));
+        // Set windowed features (device: D2D from the live memenc output; the
+        // partition itself runs in-graph)
+        if (mem_features_dev)
+            sam3_stage_feed(model.transport, mem_features_dev, x4, "perc_feat_2d");
+        else
+            ggml_backend_tensor_set(x_in, feat_windowed.data(), 0,
+                                    D * ws2 * N_2d * sizeof(float));
 
         // Set latents: [D, 256] → interpret as [D, 1, 256]
-        ggml_backend_tensor_set(lat_in, latents_2d_data.data(), 0,
-                                D * N_2d * sizeof(float));
+        if (trk)
+            sam3_stagebuf_push(model.transport, trk->tw_perc_lat2, latents_2d_data.data(),
+                               D * N_2d * sizeof(float), lat_in, 1, "perc_lat2");
+        else
+            ggml_backend_tensor_set(lat_in, latents_2d_data.data(), 0,
+                                    D * N_2d * sizeof(float));
 
         if (!sam3_graph_compute(model.backend, graph, 4)) {
             fprintf(stderr, "%s: 2D graph compute failed\n", __func__);
@@ -13041,11 +13111,21 @@ static bool sam3_encode_memory(
     // and pushing/evicting slots in tracker.mem_banks.
     SAM3_TIME_BEGIN(_t_mem_bank);
 
-    std::vector<float> md(MD * H * H);
-    ggml_backend_tensor_get(mo, md.data(), 0, md.size() * sizeof(float));
+    // Increment 4: on the CUDA device driver the EdgeTAM chain keeps the
+    // memenc output on device (the perceiver feeds from `mo` by D2D while its
+    // graph memory is still live), so the 1 MB download disappears. Gated on
+    // is_edgetam(): SAM2.1's no_obj_embed_spatial branch below mutates md on
+    // the host and must keep the verbatim path (design §3.4-4).
+    const bool device_chain = model.transport.kind == SAM3_TRANSPORT_DEVICE &&
+                              hp.is_edgetam() && hp.has_perceiver;
+    std::vector<float> md;
+    if (!device_chain) {
+        md.resize((size_t)MD * H * H);
+        ggml_backend_tensor_get(mo, md.data(), 0, md.size() * sizeof(float));
+    }
 
     // Apply no_obj_embed_spatial if occluded (SAM2.1 only — EdgeTAM does not have this)
-    if (obj_score <= 0.0f && model.no_obj_embed_spatial) {
+    if (!device_chain && obj_score <= 0.0f && model.no_obj_embed_spatial) {
         std::vector<float> no_obj_emb(MD);
         auto* noe = model.no_obj_embed_spatial;
         if (noe->type == GGML_TYPE_F16) {
@@ -13072,7 +13152,9 @@ static bool sam3_encode_memory(
 
         std::vector<float> perc_latents, perc_pos;
         if (!edgetam_perceiver_forward(model, md, mem_pos, H, H,
-                                        perc_latents, perc_pos)) {
+                                        perc_latents, perc_pos,
+                                        device_chain ? mo : nullptr,
+                                        device_chain ? &tracker : nullptr)) {
             fprintf(stderr, "%s: perceiver forward failed\n", __func__);
             SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
             ggml_gallocr_free(ga);
@@ -13637,6 +13719,9 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     sam3_stagebuf_release(tracker.tw_rope_q);
     sam3_stagebuf_release(tracker.tw_rope_k);
     sam3_stagebuf_release(tracker.tw_src_pos);
+    sam3_stagebuf_release(tracker.tw_perc_pos);
+    sam3_stagebuf_release(tracker.tw_perc_lat1);
+    sam3_stagebuf_release(tracker.tw_perc_lat2);
     // Increment 3: the recycling lists hold pointers into owned_buffers'
     // storage (freed just above) — clear them, never free through them.
     tracker.slot_free.clear();
