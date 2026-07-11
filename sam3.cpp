@@ -1291,6 +1291,26 @@ struct sam3_masklet {
     TargetState state         = TargetState::TRACKED;
     int         degrade_count = 0;  // consecutive degraded (weak) frames in AT_RISK
     int         occl_count    = 0;  // consecutive absent frames in OCCLUDED
+
+    // SAM3-WRITEGATE-03 / DAM (trackbench journal "EDGEDAM-RECON" +
+    // "WRITEGATE-03 PRE-REGISTRATION"): per-instance write-policy state for the
+    // DAM4SAM-style memory policy (SAM3_DAM_MEMORY=1; inert otherwise).
+    // dam_area_hist is the rolling window of valid-frame mask areas whose
+    // median anchors the SUBJECT-relative stability gate (G2-03 lesson: never
+    // frame-absolute area bars).
+    int                dam_last_anchor = -1000000;  // frame of last ANCHOR bank write
+    std::vector<float> dam_area_hist;               // last N valid mask areas (N = SAM3_DAM_MEDIAN_WIN)
+
+    // SAM3-WRITEGATE-04 (trackbench journal "WRITEGATE-04 — PRE-REGISTRATION"):
+    // lifecycle-gated rebuild state, SAM3_DAM_MEMORY=2 only (inert otherwise).
+    // dam_recover_frame is stamped at the AT_RISK/OCCLUDED -> TRACKED
+    // transition (U4 advance site in sam3_propagate_frame); dam_rebuild_now is
+    // the per-frame band decision computed from the state ENTERING the frame
+    // (the U4 advance runs after the append sites — wiring fact 1), consumed
+    // by memory selection (sam3_select_memory_frames) and bank trim
+    // (sam3_mem_bank_trim).
+    int  dam_recover_frame = -1000000;  // frame of last recovery transition to TRACKED
+    bool dam_rebuild_now   = false;     // this frame's rebuild-band membership
 };
 
 struct sam3_memory_slot {
@@ -1312,6 +1332,13 @@ struct sam3_memory_slot {
     float obj_score = 0.0f;   // RFD 0011 U3: objectness at this memory frame
     float mask_iou  = 0.0f;   // RFD 0011 U3: predicted mask IoU at this memory frame
     bool  is_anchor = false;  // RFD 0011 U3: high-quality long-term anchor (kept preferentially)
+    // SAM3-WRITEGATE-03 / DAM: DRM anchor slot (SAM3_DAM_MEMORY=1 only). Anchor
+    // slots hold frames where the target was correctly segmented WHILE a
+    // distractor was visibly present (decoder-introspection signal). They are
+    // cond-class protected from the recents FIFO, FIFO'd among themselves
+    // (cap SAM3_DAM_ANCHOR_SLOTS), and attended with tpos=0 like the seed
+    // (DAM4SAM's DRM carries no temporal encoding — a time-less identity prior).
+    bool  is_dam_anchor = false;
 };
 
 // RFD 0011 U3: constant-velocity Kalman, one independent 2-state [pos,vel]
@@ -10678,6 +10705,67 @@ static float iou_cxcywh(const float a[4], const float b[4]) {
     return (uni > 0.0f) ? inter / uni : 0.0f;
 }
 
+// ─── SAM3-WRITEGATE-03 / DAM: config (trackbench journal "EDGEDAM-RECON" +
+// "WRITEGATE-03" prereg/iteration entries; DAM4SAM: Videnovic et al., arXiv
+// 2411.17576 / IJCV 2509.13864). Master knob SAM3_DAM_MEMORY=1; unset/≠1 =
+// shipped behavior, byte-identical (drop-in proof = prereg P0). Iteration 2
+// scope (anchors-only — iteration tables in the journal): the RECENTS half of
+// the bank stays fully SHIPPED (per-frame credible writes, pool cap
+// 2×num_maskmem, U3-SAMURAI selection — probes proved it stronger than
+// DAM4SAM's newest+stride RAM here); DAM adds only the DRM ANCHOR organ:
+// frames where the target was correctly segmented WHILE a distractor was
+// visibly present, held in cond-protected FIFO slots, force-attended at
+// tpos 0 (time-less identity prior).
+struct sam3_dam_cfg {
+    bool  on           = false;
+    float ratio        = 0.7f;  // θ_anc: bbox-area ratio below which a distractor is declared
+    int   delta        = 5;     // Δ: min frames between ANCHOR writes
+    float stable_iou   = 0.8f;  // anchor stability: predicted-IoU floor
+    float area_band    = 0.2f;  // anchor stability: ±band around the rolling median area
+    int   anchor_slots = 3;     // DRM capacity (0 = ablation arm ≡ shipped behavior)
+    int   median_win   = 10;    // rolling window of valid-frame areas for the median
+    // SAM3-WRITEGATE-04 (journal "WRITEGATE-04 — PRE-REGISTRATION"):
+    // SAM3_DAM_MEMORY is a MODE. 0/unset = shipped (byte-identical); 1 =
+    // EXACTLY WG3 iteration 2 (anchors-only — the reproducibility arm, no code
+    // moves on this path); 2 = WG4 = iter2 anchors + lifecycle-gated rebuild
+    // recents. recovery_k = frames after an AT_RISK/OCCLUDED -> TRACKED
+    // transition during which the rebuild band stays open (default 25 ≈
+    // pool-rebuild horizon 14 + T_OCCL margin; registered knob, mode-2 only).
+    int   mode         = 0;
+    int   recovery_k   = 25;
+};
+static const sam3_dam_cfg& sam3_dam() {
+    static sam3_dam_cfg c;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        const char* s = getenv("SAM3_DAM_MEMORY");
+        c.mode = s ? atoi(s) : 0;
+        if (c.mode != 1 && c.mode != 2) c.mode = 0;
+        c.on = (c.mode != 0);
+        if (c.on) {
+            if ((s = getenv("SAM3_DAM_RATIO")))        c.ratio        = (float)atof(s);
+            if ((s = getenv("SAM3_DAM_DELTA")))        c.delta        = atoi(s);
+            if ((s = getenv("SAM3_DAM_STABLE_IOU")))   c.stable_iou   = (float)atof(s);
+            if ((s = getenv("SAM3_DAM_AREA_BAND")))    c.area_band    = (float)atof(s);
+            if ((s = getenv("SAM3_DAM_ANCHOR_SLOTS"))) c.anchor_slots = atoi(s);
+            if ((s = getenv("SAM3_DAM_MEDIAN_WIN")))   c.median_win   = atoi(s);
+            if ((s = getenv("SAM3_DAM_RECOVERY_K")))   c.recovery_k   = atoi(s);
+            if (c.median_win < 1) c.median_win = 1;
+            if (c.recovery_k < 0) c.recovery_k = 0;
+            fprintf(stderr, "sam3: SAM3_DAM_MEMORY=%d — DAM4SAM anchor policy ACTIVE%s "
+                    "(ratio=%.2f delta=%d stable_iou=%.2f area_band=%.2f "
+                    "anchor_slots=%d median_win=%d recovery_k=%d)\n",
+                    c.mode,
+                    c.mode == 2 ? " + WG4 lifecycle-gated rebuild recents" : "",
+                    c.ratio, c.delta, c.stable_iou, c.area_band,
+                    c.anchor_slots, c.median_win, c.recovery_k);
+        }
+    }
+    return c;
+}
+// ─── end SAM3-WRITEGATE-03 / DAM config ─────────────────────────────────────
+
 // RFD 0011 U3: motion-aware memory-frame selection (SAMURAI, "Level 1").
 // Replaces the previous purely-uniform temporal sampling. When a Kalman motion
 // prediction `pred` (cx,cy,w,h normalized) is supplied, intermediate memory
@@ -10695,11 +10783,91 @@ static float iou_cxcywh(const float a[4], const float b[4]) {
 static std::vector<int> sam3_select_memory_frames(
     const std::vector<sam3_memory_slot>& bank,
     int max_slots,
-    const float* pred /* cx,cy,w,h, or nullptr */) {
+    const float* pred /* cx,cy,w,h, or nullptr */,
+    bool dam_rebuild = false /* SAM3-WRITEGATE-04: masklet in the rebuild band */) {
     if ((int)bank.size() <= max_slots) {
         std::vector<int> all(bank.size());
         for (int i = 0; i < (int)bank.size(); ++i) all[i] = i;
         return all;
+    }
+
+    // SAM3-WRITEGATE-04 (journal "WRITEGATE-04 — PRE-REGISTRATION"): while the
+    // masklet's U4 lifecycle sits in the rebuild band (AT_RISK, or TRACKED
+    // within SAM3_DAM_RECOVERY_K frames of an AT_RISK/OCCLUDED recovery, with
+    // DAM anchors present), attention gets WG3-iter1's fresh-recents structure:
+    // seed + anchors + the FRESHEST recents, newest-first — the fresh-dominance
+    // that produced the dt0012 native heal (frac 0.578, f526). Outside the band
+    // (dam_rebuild=false, incl. all of mode 1) the iter2 paths below run
+    // byte-identically.
+    if (sam3_dam().on && dam_rebuild) {
+        const int n = (int)bank.size();
+        std::vector<int> selected;
+        selected.push_back(0);
+        selected.push_back(n - 1);
+        for (int i = 1; i < n - 1; ++i)
+            if (bank[i].is_dam_anchor) selected.push_back(i);
+        for (int i = n - 2; i >= 1 && (int)selected.size() < max_slots; --i)
+            if (!bank[i].is_dam_anchor) selected.push_back(i);
+        std::sort(selected.begin(), selected.end());
+        selected.erase(std::unique(selected.begin(), selected.end()),
+                       selected.end());
+        return selected;
+    }
+
+    // SAM3-WRITEGATE-03 / DAM (iteration 2, anchors-only): DRM anchor slots
+    // are FORCE-INCLUDED in the attended set (DAM4SAM attends every DRM frame;
+    // they are the identity prior and must not lose a SAMURAI score-fight to
+    // fresher thief slots), alongside the always-kept seed (0) and newest
+    // (n-1). The remaining budget is filled by the shipped scoring over
+    // non-anchor interiors. When the bank holds NO anchors this block is
+    // skipped and the shipped path below runs unchanged (⇒ the
+    // SAM3_DAM_ANCHOR_SLOTS=0 ablation arm reproduces shipped behavior).
+    if (sam3_dam().on) {
+        bool has_anchor = false;
+        for (const auto& s : bank)
+            if (s.is_dam_anchor) { has_anchor = true; break; }
+        if (has_anchor) {
+            const int n = (int)bank.size();
+            std::vector<int> selected;
+            selected.push_back(0);
+            selected.push_back(n - 1);
+            for (int i = 1; i < n - 1; ++i)
+                if (bank[i].is_dam_anchor) selected.push_back(i);
+            std::sort(selected.begin(), selected.end());
+            selected.erase(std::unique(selected.begin(), selected.end()),
+                           selected.end());
+            int remaining = max_slots - (int)selected.size();
+            if (remaining > 0) {
+                struct Scored { int idx; float score; };
+                std::vector<Scored> cand;
+                for (int i = 1; i < n - 1; ++i) {
+                    const sam3_memory_slot& s = bank[i];
+                    if (s.is_dam_anchor) continue;
+                    // same blend as the shipped path below; motion term 0
+                    // when no prediction exists yet
+                    const float box[4] = { s.box_cx, s.box_cy, s.box_w, s.box_h };
+                    const float motion = pred ? iou_cxcywh(box, pred) : 0.0f;
+                    const float recency = (n > 1) ? (float)i / (float)(n - 1) : 0.0f;
+                    float score = 0.4f * motion
+                                + 0.3f * s.mask_iou
+                                + 0.2f * s.obj_score
+                                + 0.1f * recency
+                                + (s.is_anchor ? 0.15f : 0.0f);
+                    cand.push_back({ i, score });
+                }
+                std::sort(cand.begin(), cand.end(),
+                          [](const Scored& a, const Scored& b) {
+                    if (a.score != b.score) return a.score > b.score;
+                    return a.idx > b.idx;
+                });
+                const int take = std::min(remaining, (int)cand.size());
+                for (int k = 0; k < take; ++k) selected.push_back(cand[k].idx);
+            }
+            std::sort(selected.begin(), selected.end());
+            selected.erase(std::unique(selected.begin(), selected.end()),
+                           selected.end());
+            return selected;
+        }
     }
 
     // Fallback: no motion estimate yet (e.g. very first hold frame, before the
@@ -12436,12 +12604,175 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 ** Video tracking (Phase 7)
 *****************************************************************************/
 
+// ─── SAM3-WRITEGATE-03 / DAM: DAM4SAM distractor-resolving memory policy ────
+// (trackbench journal "EDGEDAM-RECON" + "WRITEGATE-03 PRE-REGISTRATION";
+// DAM4SAM: Videnovic et al., arXiv 2411.17576 / IJCV 2509.13864.)
+// WG1 proved ambiguous-frame appends fuel the thief latch but its static
+// pred-IoU floor also starved the legitimate crossing-recovery ladder (dt0014
+// frac 0.621→0.043). WG2's staleness escape discriminated WHEN but not WHO
+// (dt0047 inverted 39→1123 wrong). DAM4SAM's answer is a WHO signal computed
+// by introspecting the decoder's UNCHOSEN multimask alternatives, plus a
+// RAM/DRM write split: RECENT writes are Δ-throttled with NO quality floor,
+// ANCHOR writes capture distractor-present-yet-stable frames into a permanent,
+// cond-protected region that outvotes recent poison in memory attention.
+// Master knob SAM3_DAM_MEMORY=1; unset/≠1 = shipped behavior, byte-identical
+// (drop-in proof = prereg P0).
+// DAM distractor introspection (the free WHO signal): the decoder computes 4
+// candidate masks + iou predictions and the tracker keeps only the best of
+// tokens 1-3. DAM4SAM's test on the discarded alternatives: threshold the
+// unchosen masks at logit>0, remove overlap with the chosen mask, keep the
+// largest 4-connected component; a distractor is present iff
+//   area(bbox(chosen)) / area(bbox(chosen ∪ largest-component)) < θ_anc.
+// A large off-chosen component stretches the union bbox ⇒ ratio drops. This
+// separates "low-conf because a competitor is in frame" from "low-conf because
+// the subject is small/re-emerging" — the poison-vs-ladder distinction WG1's
+// static floor provably could not make. masks4 = 4 contiguous mhw×mhw logit
+// grids (decoder layout); best_idx ∈ {1,2,3}. Cost: one CPU pass over the
+// low-res grids, ≪1ms vs the 47-62ms hold.
+static bool sam3_dam_distractor_present(const float* masks4, int best_idx,
+                                        int mhw, float ratio_thr) {
+    const int n = mhw * mhw;
+    const float* best = masks4 + (size_t)best_idx * n;
+    // bbox of the chosen mask
+    int bx0 = mhw, by0 = mhw, bx1 = -1, by1 = -1;
+    for (int y = 0; y < mhw; ++y)
+        for (int x = 0; x < mhw; ++x)
+            if (best[y * mhw + x] > 0.0f) {
+                if (x < bx0) bx0 = x;
+                if (x > bx1) bx1 = x;
+                if (y < by0) by0 = y;
+                if (y > by1) by1 = y;
+            }
+    if (bx1 < 0) return false;  // empty chosen mask: nothing to compare against
+    // union of the unchosen alternatives, minus the chosen mask
+    std::vector<uint8_t> alt(n, 0);
+    bool any = false;
+    for (int m = 1; m < 4; ++m) {
+        if (m == best_idx) continue;
+        const float* a = masks4 + (size_t)m * n;
+        for (int i = 0; i < n; ++i)
+            if (a[i] > 0.0f && !(best[i] > 0.0f)) { alt[i] = 1; any = true; }
+    }
+    if (!any) return false;  // alternatives agree with the chosen mask
+    // largest 4-connected component of the residual (iterative flood fill)
+    int cbx0 = 0, cby0 = 0, cbx1 = -1, cby1 = -1, cbest = 0;
+    std::vector<int> stack;
+    for (int i = 0; i < n; ++i) {
+        if (!alt[i]) continue;
+        int sz = 0, x0 = mhw, y0 = mhw, x1 = -1, y1 = -1;
+        alt[i] = 0;
+        stack.assign(1, i);
+        while (!stack.empty()) {
+            int p = stack.back();
+            stack.pop_back();
+            ++sz;
+            int px = p % mhw, py = p / mhw;
+            if (px < x0) x0 = px;
+            if (px > x1) x1 = px;
+            if (py < y0) y0 = py;
+            if (py > y1) y1 = py;
+            if (px > 0        && alt[p - 1])   { alt[p - 1] = 0;   stack.push_back(p - 1); }
+            if (px < mhw - 1  && alt[p + 1])   { alt[p + 1] = 0;   stack.push_back(p + 1); }
+            if (py > 0        && alt[p - mhw]) { alt[p - mhw] = 0; stack.push_back(p - mhw); }
+            if (py < mhw - 1  && alt[p + mhw]) { alt[p + mhw] = 0; stack.push_back(p + mhw); }
+        }
+        if (sz > cbest) { cbest = sz; cbx0 = x0; cby0 = y0; cbx1 = x1; cby1 = y1; }
+    }
+    if (cbest == 0) return false;
+    const float area_best = (float)(bx1 - bx0 + 1) * (float)(by1 - by0 + 1);
+    const float ux0 = (float)std::min(bx0, cbx0), uy0 = (float)std::min(by0, cby0);
+    const float ux1 = (float)std::max(bx1, cbx1), uy1 = (float)std::max(by1, cby1);
+    const float area_union = (ux1 - ux0 + 1.0f) * (uy1 - uy0 + 1.0f);
+    return (area_best / area_union) < ratio_thr;
+}
+
+// DAM write-policy admission for one credible frame (called ONLY when
+// sam3_dam().on; the caller keeps report/Kalman/lifecycle untouched — this
+// gates TEACHING only, WG1's discipline). At most one write per frame, anchor
+// priority, so encode cost never exceeds shipped.
+//   RECENT: every credible non-empty frame teaches — exactly the SHIPPED
+//           cadence (iteration 2, anchors-only: iteration 0's write throttle
+//           starved the newest slot + pushed obj-ptr tpos out of its 16-frame
+//           range; iteration 1's newest+stride RAM removed the load-bearing
+//           SAMURAI selection and inverted dt0047 — probe tables in the
+//           journal. DAM4SAM itself writes memory EVERY frame; Δ is a
+//           read-stride in their code, and our shipped U3 recents policy is
+//           already the stronger organ).
+//   ANCHOR: distractor-present ∧ stable (pred-IoU > stable_iou ∧ area within
+//           ±area_band of the rolling median of the last median_win valid
+//           areas — subject-relative, G2-03) ∧ Δ since the last anchor
+//           (dam4sam_tracker.py:231's exact condition set).
+static bool sam3_dam_admit(sam3_masklet& ml, bool distractor, float pred_iou,
+                           float area, int fi, bool* as_anchor) {
+    const sam3_dam_cfg& dam = sam3_dam();
+    *as_anchor = false;
+    // rolling median of PRIOR valid areas (current frame judged against it)
+    float med = -1.0f;
+    if (!ml.dam_area_hist.empty()) {
+        std::vector<float> h = ml.dam_area_hist;
+        std::nth_element(h.begin(), h.begin() + h.size() / 2, h.end());
+        med = h[h.size() / 2];
+    }
+    if (area > 0.0f) {
+        ml.dam_area_hist.push_back(area);
+        if ((int)ml.dam_area_hist.size() > dam.median_win)
+            ml.dam_area_hist.erase(ml.dam_area_hist.begin());
+    }
+    const bool stable = pred_iou > dam.stable_iou && med > 0.0f &&
+                        area >= (1.0f - dam.area_band) * med &&
+                        area <= (1.0f + dam.area_band) * med;
+    if (dam.anchor_slots > 0 && distractor && stable &&
+        fi - ml.dam_last_anchor >= dam.delta) {
+        ml.dam_last_anchor = fi;
+        *as_anchor = true;
+        return true;
+    }
+    return area > 0.0f;  // RECENT: per-frame teach, non-empty only
+}
+
+// SAM3-WRITEGATE-04 (journal "WRITEGATE-04 — PRE-REGISTRATION" + "CALIBRATION
+// ITERATION #1"): rebuild-band membership for one masklet at frame fi, decided
+// from the U4 lifecycle state ENTERING the frame (the advance runs after the
+// append sites). Band OPEN iff
+//   NOT (state == TRACKED ∧ fi − dam_recover_frame > K)
+//   ∧ the bank holds ≥1 DAM anchor,
+// i.e. with the identity prior banked, shipped-conservative recents apply ONLY
+// while stably TRACKED; contested (AT_RISK), recovering (TRACKED within K of
+// an AT_RISK/OCCLUDED -> TRACKED transition, dam_recover_frame, K =
+// SAM3_DAM_RECOVERY_K), absent (OCCLUDED) and dead (LOST) states all run the
+// rebuild structure. Iteration 0 had OCCLUDED/LOST out of the band; its tables
+// showed LOST-terminal seals the band ~f200 on dt0012 native while the
+// truncation mechanism (band episodes rot the thief latch's bank footing:
+// honest death f581→f462) still had work to do — iteration #1 extends the set.
+// The anchors-present conjunct is WG3's design note ("with anchors present")
+// and the load-bearing dt0047 defense: ZERO anchors ever bank on dt0047
+// (iter2 ON ≡ shipped OFF numerically), so its absence/death windows are
+// immune to the band by construction; without anchors the rebuild is iter1's
+// proven poison (dt0047 902).
+static bool sam3_dam_rebuild_active(const sam3_masklet& ml,
+                                    const std::vector<sam3_memory_slot>& bank,
+                                    int fi) {
+    const sam3_dam_cfg& dam = sam3_dam();
+    if (dam.mode != 2) return false;
+    const bool stable_tracked =
+        ml.state == TargetState::TRACKED &&
+        fi - ml.dam_recover_frame > dam.recovery_k;
+    if (stable_tracked) return false;
+    for (const auto& s : bank)
+        if (s.is_dam_anchor) return true;
+    return false;
+}
+// ─── end SAM3-WRITEGATE-03/04 DAM helpers ───────────────────────────────────
+
 struct sam3_prop_output {
     std::vector<float> mask_logits;
     std::vector<float> iou_scores;
     float obj_score;
     std::vector<float> sam_token;
     int n_masks, mask_h, mask_w;
+    // SAM3-WRITEGATE-03 / DAM: decoder-introspection distractor flag for this
+    // frame (see sam3_dam_distractor_present). Always false when DAM is off.
+    bool dam_distractor = false;
 };
 
 // Lazily compute and cache PE/RoPE data that is identical across all propagation calls.
@@ -12506,7 +12837,11 @@ static sam3_prop_output sam3_propagate_single(
     // RFD 0011 U3: motion-aware memory selection. motion_pred is the per-instance
     // constant-velocity prediction supplied by sam3_propagate_frame; when null
     // (no motion model yet) the selector falls back to uniform sampling.
-    auto sel = sam3_select_memory_frames(mem_bank, hp.num_maskmem, motion_pred);
+    // SAM3-WRITEGATE-04: masklet.dam_rebuild_now (set by sam3_propagate_frame
+    // before this call, always false outside SAM3_DAM_MEMORY=2) switches the
+    // selection to the rebuild-band fresh-recents structure.
+    auto sel = sam3_select_memory_frames(mem_bank, hp.num_maskmem, motion_pred,
+                                         masklet.dam_rebuild_now);
     if (sel.empty()) return output;
 
     // ── Build prompt and prompt_pos via sam3_build_prompt_and_pos ─────────
@@ -12566,7 +12901,12 @@ static sam3_prop_output sam3_propagate_single(
                 }
             }
         }
-        spatial_tpos[s] = mem_bank[sel[s]].is_cond_frame ? 0 : (n_sel - s);
+        // SAM3-WRITEGATE-03 / DAM: DRM anchor slots carry NO temporal encoding
+        // — attended at tpos=0 like the cond/seed frame, a time-less identity
+        // prior (DAM4SAM). is_dam_anchor is only ever set under SAM3_DAM_MEMORY,
+        // so the shipped tpos assignment is byte-identical with DAM off.
+        spatial_tpos[s] = (mem_bank[sel[s]].is_cond_frame ||
+                           mem_bank[sel[s]].is_dam_anchor) ? 0 : (n_sel - s);
     }
 
     std::vector<std::vector<float>> obj_ptrs(P);
@@ -12726,6 +13066,13 @@ static sam3_prop_output sam3_propagate_single(
                 output.iou_scores.assign(1, biou);
                 output.obj_score = dobj;
                 output.sam_token.assign(dtok.begin() + (size_t)best * D, dtok.begin() + (size_t)(best + 1) * D);
+                // SAM3-WRITEGATE-03 / DAM: on the full-CoreML path all 4
+                // candidate masks are ALREADY in this CPU buffer — the
+                // distractor introspection costs zero extra tensor reads
+                // (journal "WRITEGATE-03 PRE-REGISTRATION", seam recon delta).
+                if (sam3_dam().on)
+                    output.dam_distractor = sam3_dam_distractor_present(
+                        dmasks.data(), best, mhw, sam3_dam().ratio);
                 return output;  // no ggml graph at all
             }
         }
@@ -13102,6 +13449,19 @@ static sam3_prop_output sam3_propagate_single(
         output.iou_scores[0] = best_iou;
         ggml_backend_tensor_get(o_obj, &output.obj_score, 0, sizeof(float));
 
+        // SAM3-WRITEGATE-03 / DAM: ggml fallback seam — the unchosen
+        // alternatives sit in the decoder's all-tokens mask tensor (o_masks
+        // in the fork's graph-cache decode — the same tensor the best-mask
+        // read above offsets into); recover them with one extra tensor read
+        // and run the same introspection as the CoreML path.
+        if (sam3_dam().on) {
+            std::vector<float> allm((size_t)num_mask_tokens * mhw * mhw);
+            ggml_backend_tensor_get(o_masks, allm.data(), 0,
+                                    allm.size() * sizeof(float));
+            output.dam_distractor = sam3_dam_distractor_present(
+                allm.data(), best_idx, mhw, sam3_dam().ratio);
+        }
+
         // Object pointer token: use best multimask token if use_multimask_token_for_obj_ptr
         output.sam_token.resize(D);
         if (hp.use_multimask_token_for_obj_ptr && o_mtok) {
@@ -13287,10 +13647,102 @@ static inline int sam3_mem_pool_cap(int num_maskmem) {
     return num_maskmem > 0 ? num_maskmem * 2 : 1;
 }
 
+// SAM3-WRITEGATE-03 / DAM: single bank-trim policy for all three slot-push
+// sites in sam3_encode_memory (CoreML memenc — the LIVE path under the capi
+// posture — plus the ggml perceiver and standard paths).
+//   DAM off: byte-identical shipped behavior — pool cap 2×num_maskmem, evict
+//            the oldest non-cond slot first.
+//   DAM on (iteration 2, anchors-only — journal "WRITEGATE-03" iteration
+//            entries): SAME shipped pool semantics for the recents (per-frame
+//            writes + SAMURAI selection proved load-bearing: replacing them
+//            with DAM4SAM's newest+stride RAM inverted dt0047), with DRM
+//            anchor slots additionally cond-class PROTECTED from the recents
+//            FIFO and FIFO'd among themselves (cap anchor_slots). Attended
+//            token count is unchanged (selection still returns ≤ num_maskmem;
+//            PAD_BANK still pads to 3648).
+// SAM3-WRITEGATE-03/04 memory-bank trim, MERGED with the fork's increment-3
+// fixed ring (092b313): every evicted slot recycles its device tensors via
+// sam3_recycle_slot — including DAM anchor-FIFO evictions — so the VRAM-leak
+// fix survives the DAM policy. tracker may be nullptr on the CoreML in-mm
+// path, whose slots are not ring-allocated (the patch's original no-recycle
+// semantics there, byte-identical).
+static void sam3_mem_bank_trim(sam3_tracker* tracker,
+                               std::vector<sam3_memory_slot>& bk, int num_maskmem,
+                               bool dam_rebuild = false /* SAM3-WRITEGATE-04 */) {
+    auto evict = [&](std::vector<sam3_memory_slot>::iterator it) {
+        if (tracker) sam3_recycle_slot(*tracker, *it);
+        bk.erase(it);
+    };
+    const sam3_dam_cfg& dam = sam3_dam();
+    if (!dam.on) {
+        while ((int)bk.size() > sam3_mem_pool_cap(num_maskmem)) {
+            bool removed = false;
+            for (auto it = bk.begin(); it != bk.end(); ++it)
+                if (!it->is_cond_frame) { evict(it); removed = true; break; }
+            if (!removed) evict(bk.begin() + 1);
+        }
+        return;
+    }
+    // anchor region FIFO (oldest anchor out when over capacity)
+    int n_anchor = 0;
+    for (const auto& s : bk) if (s.is_dam_anchor) ++n_anchor;
+    while (n_anchor > dam.anchor_slots) {
+        for (auto it = bk.begin(); it != bk.end(); ++it)
+            if (it->is_dam_anchor) { evict(it); break; }
+        --n_anchor;
+    }
+    // SAM3-WRITEGATE-04 (journal "WRITEGATE-04 — PRE-REGISTRATION"): while the
+    // masklet sits in the rebuild band, recents get WG3-iter1's newest+Δ-grid
+    // RAM structure: cap num_maskmem (not 2×), newest always kept, older
+    // non-anchor recents evicted OFF the Δ-grid first (iter1's
+    // ((idx-1)//r)*r walk), seed + anchors protected. Outside the band
+    // (dam_rebuild=false, incl. all of mode 1) the iter2 loop below runs
+    // byte-identically.
+    if (dam.mode == 2 && dam_rebuild) {
+        while ((int)bk.size() > num_maskmem) {
+            bool removed = false;
+            // pass 1: oldest non-cond, non-anchor, non-newest recent OFF the Δ-grid
+            for (auto it = bk.begin(); it != bk.end(); ++it) {
+                if (it->is_cond_frame || it->is_dam_anchor) continue;
+                if (it + 1 == bk.end()) continue;  // newest recent always kept
+                if (dam.delta > 1 && it->frame_index >= 0 &&
+                    it->frame_index % dam.delta == 0) continue;
+                evict(it); removed = true; break;
+            }
+            if (removed) continue;
+            // pass 2: oldest non-cond, non-anchor, non-newest (grid slots too)
+            for (auto it = bk.begin(); it != bk.end(); ++it) {
+                if (it->is_cond_frame || it->is_dam_anchor) continue;
+                if (it + 1 == bk.end()) continue;
+                evict(it); removed = true; break;
+            }
+            if (!removed) break;  // only seed/anchors/newest left (≤ 5 slots)
+        }
+        return;
+    }
+    // recents: shipped pool semantics, anchors protected alongside cond
+    while ((int)bk.size() > sam3_mem_pool_cap(num_maskmem)) {
+        bool removed = false;
+        for (auto it = bk.begin(); it != bk.end(); ++it)
+            if (!it->is_cond_frame && !it->is_dam_anchor) {
+                evict(it);
+                removed = true;
+                break;
+            }
+        if (!removed) {
+            for (auto it = bk.begin(); it != bk.end(); ++it)
+                if (!it->is_cond_frame) { evict(it); removed = true; break; }
+        }
+        if (!removed) evict(bk.begin() + 1);
+    }
+}
+
 static bool sam3_encode_memory(
     sam3_tracker& tracker, sam3_state& state, const sam3_model& model,
     int inst_id, const float* mask_logits, int mask_h, int mask_w,
-    int frame_idx, bool is_cond, float obj_score) {
+    int frame_idx, bool is_cond, float obj_score,
+    bool dam_anchor = false /* SAM3-WRITEGATE-03: DRM anchor write */,
+    bool dam_rebuild = false /* SAM3-WRITEGATE-04: masklet in the rebuild band */) {
     const auto& hp = model.hparams;
     const int D = hp.neck_dim, MD = hp.mem_out_dim;
     const int H = sam3_eff_feat_size(state, hp);
@@ -13363,14 +13815,10 @@ static bool sam3_encode_memory(
                 slot.spatial_pe = store_slot(mpos);
                 slot.frame_index = frame_idx;
                 slot.is_cond_frame = is_cond;
+                slot.is_dam_anchor = dam_anchor;  // SAM3-WRITEGATE-03 / DAM
                 auto& bk = tracker.mem_banks[inst_id];
                 bk.push_back(slot);
-                while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
-                    bool removed = false;
-                    for (auto it = bk.begin(); it != bk.end(); ++it)
-                        if (!it->is_cond_frame) { bk.erase(it); removed = true; break; }
-                    if (!removed) bk.erase(bk.begin() + 1);
-                }
+                sam3_mem_bank_trim(nullptr, bk, hp.num_maskmem, dam_rebuild);  // CoreML path: no ring, no recycle
                 return true;
             }
         }
@@ -13609,26 +14057,15 @@ static bool sam3_encode_memory(
         slot.buf = slot_buf;
         slot.frame_index = frame_idx;
         slot.is_cond_frame = is_cond;
+        slot.is_dam_anchor = dam_anchor;  // SAM3-WRITEGATE-03 / DAM
         auto& bk = tracker.mem_banks[inst_id];
         bk.push_back(slot);
         // RFD 0011 U3: trim to the memory POOL cap (>= num_maskmem) rather than
         // exactly num_maskmem, so sam3_select_memory_frames has a real choice of
         // motion-consistent slots. Still drop the oldest non-cond slot first.
-        // Increment 3: evicted slots recycle their tensors instead of leaking.
-        while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
-            bool removed = false;
-            for (auto it = bk.begin(); it != bk.end(); ++it)
-                if (!it->is_cond_frame) {
-                    sam3_recycle_slot(tracker, *it);
-                    bk.erase(it);
-                    removed = true;
-                    break;
-                }
-            if (!removed) {
-                sam3_recycle_slot(tracker, bk[1]);
-                bk.erase(bk.begin() + 1);
-            }
-        }
+        // SAM3-WRITEGATE-03: policy factored into sam3_mem_bank_trim (DAM off =
+        // this exact shipped loop; DAM on = attended-set cap + anchor FIFO).
+        sam3_mem_bank_trim(&tracker, bk, hp.num_maskmem, dam_rebuild);  // merged: DAM policy + increment-3 recycle
         SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
         if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
         return true;
@@ -13658,26 +14095,15 @@ static bool sam3_encode_memory(
     slot.buf = slot_buf;
     slot.frame_index = frame_idx;
     slot.is_cond_frame = is_cond;
+    slot.is_dam_anchor = dam_anchor;  // SAM3-WRITEGATE-03 / DAM
     auto& bk = tracker.mem_banks[inst_id];
     bk.push_back(slot);
     // RFD 0011 U3: trim to the memory POOL cap (see perceiver path above and
     // sam3_mem_pool_cap). Selection of the attended num_maskmem subset is the
     // motion-aware sam3_select_memory_frames; eviction here only bounds storage.
-    // Increment 3: evicted slots recycle their tensors instead of leaking.
-    while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
-        bool removed = false;
-        for (auto it = bk.begin(); it != bk.end(); ++it)
-            if (!it->is_cond_frame) {
-                sam3_recycle_slot(tracker, *it);
-                bk.erase(it);
-                removed = true;
-                break;
-            }
-        if (!removed) {
-            sam3_recycle_slot(tracker, bk[1]);
-            bk.erase(bk.begin() + 1);
-        }
-    }
+    // SAM3-WRITEGATE-03: policy factored into sam3_mem_bank_trim (DAM off =
+    // the exact shipped loop; DAM on = attended-set cap + anchor FIFO).
+    sam3_mem_bank_trim(&tracker, bk, hp.num_maskmem, dam_rebuild);  // merged: DAM policy + increment-3 recycle
     SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
     if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
     return true;
@@ -14296,6 +14722,12 @@ sam3_result sam3_propagate_frame(
         float pred[4];
         bool have = kf.init;
         if (have) kf.predict(pred);
+        // SAM3-WRITEGATE-04: decide this masklet's rebuild-band membership for
+        // the whole frame (selection in sam3_propagate_single + trim in the
+        // encode loop below) from the state ENTERING the frame. Always false
+        // outside SAM3_DAM_MEMORY=2.
+        ml.dam_rebuild_now = sam3_dam().on &&
+                             sam3_dam_rebuild_active(ml, im->second, fi);
         po[id] = sam3_propagate_single(tracker, state, model, ml, im->second,
                                        tracker.ptr_banks[id], have ? pred : nullptr);
         if (po[id].mask_logits.empty()) continue;
@@ -14367,6 +14799,10 @@ sam3_result sam3_propagate_frame(
         float pred[4];
         bool have = kf.init;
         if (have) kf.predict(pred);
+        // SAM3-WRITEGATE-04: rebuild-band membership for this frame (see the
+        // active loop above). Always false outside SAM3_DAM_MEMORY=2.
+        ml.dam_rebuild_now = sam3_dam().on &&
+                             sam3_dam_rebuild_active(ml, im->second, fi);
         auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second,
                                         tracker.ptr_banks[id], have ? pred : nullptr);
         if (!p2.mask_logits.empty()) {
@@ -14401,9 +14837,21 @@ sam3_result sam3_propagate_frame(
                 meas_from_lrb(lrb[id], meas);
                 ml.last_motion_iou = have ? iou_cxcywh(pred, meas.data()) : 1.0f;
                 kf.update(meas.data());
+                // SAM3-WRITEGATE-03 / DAM write policy (journal "EDGEDAM-RECON"
+                // + "WRITEGATE-03 PRE-REGISTRATION"): under SAM3_DAM_MEMORY the
+                // unconditional per-frame teach becomes a Δ-throttled RECENT
+                // write or a distractor+stable ANCHOR write. The report, Kalman
+                // update and lifecycle above are untouched — the policy stops
+                // TEACHING, not reporting (WG1 discipline).
+                bool dam_anchor = false;
+                if (sam3_dam().on &&
+                    !sam3_dam_admit(ml, p2.dam_distractor, p2.iou_scores[0],
+                                    lrb[id].area_ratio, fi, &dam_anchor))
+                    continue;
                 sam3_encode_memory(tracker, state, model, id,
                                    p2.mask_logits.data(), p2.mask_h, p2.mask_w,
-                                   fi, false, p2.obj_score);
+                                   fi, false, p2.obj_score, dam_anchor,
+                                   ml.dam_rebuild_now /* SAM3-WRITEGATE-04 */);
                 // RFD 0011 U3: stamp the just-pushed slot with this frame's box
                 // + quality so the motion selector can score it next time. A
                 // slot is an anchor when both objectness and predicted mask IoU
@@ -14435,9 +14883,22 @@ sam3_result sam3_propagate_frame(
         // and stamp the new slot's bbox/quality metadata for future selection.
         auto cit = credible_map.find(id);
         if (cit == credible_map.end() || !cit->second) continue;
+        // SAM3-WRITEGATE-03 / DAM write policy (see the pending-masklet site
+        // above): Δ-throttled RECENT write or distractor+stable ANCHOR write.
+        // Report + motion update (already applied in the propagate loop) are
+        // untouched — teaching only.
+        bool dam_anchor = false;
+        if (sam3_dam().on) {
+            auto lb = lrb.find(id);
+            const float area = (lb != lrb.end()) ? lb->second.area_ratio : 0.0f;
+            if (!sam3_dam_admit(ml, it->second.dam_distractor,
+                                it->second.iou_scores[0], area, fi, &dam_anchor))
+                continue;
+        }
         sam3_encode_memory(tracker, state, model, id,
                            it->second.mask_logits.data(), it->second.mask_h,
-                           it->second.mask_w, fi, false, it->second.obj_score);
+                           it->second.mask_w, fi, false, it->second.obj_score,
+                           dam_anchor, ml.dam_rebuild_now /* SAM3-WRITEGATE-04 */);
         // RFD 0011 U3: record this memory frame's box + quality on the slot that
         // sam3_encode_memory just pushed, so the motion-aware selector can score
         // its trajectory consistency on subsequent frames.
@@ -14481,8 +14942,17 @@ sam3_result sam3_propagate_frame(
             float area = (lb != lrb.end()) ? lb->second.area_ratio : 0.0f;
             auto kit = tracker.kf.find(id);
             bool warm = (kit != tracker.kf.end()) && kit->second.init;
+            // SAM3-WRITEGATE-04: capture the recovery transition for the
+            // rebuild band. Stamped only under SAM3_DAM_MEMORY=2 (the field is
+            // never read otherwise); the state machine itself is untouched.
+            const TargetState prev_state = ml.state;
             sam3_update_target_state(ml, credible, ml.last_score,
                                      ml.last_motion_iou, area, warm);
+            if (sam3_dam().mode == 2 &&
+                ml.state == TargetState::TRACKED &&
+                (prev_state == TargetState::AT_RISK ||
+                 prev_state == TargetState::OCCLUDED))
+                ml.dam_recover_frame = fi;
         };
         for (auto& ml : tracker.masklets) advance_state(ml);
         for (auto& ml : tracker.pending)  advance_state(ml);
