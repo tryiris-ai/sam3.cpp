@@ -51,6 +51,16 @@ add_subdirectory(ggml)
 
 # sam3 static library
 add_library(sam3 STATIC sam3.cpp sam3.h)
+if(NOT APPLE AND SAM3_CUDA)
+    # STEP-5 device frame preprocess (Windows parity plan v1): bit-exact
+    # CUDA twin of sam3_resize_bilinear + ImageNet normalize. -fmad=false is
+    # LOAD-BEARING for the byte gate (no FMA contraction in the double chain).
+    enable_language(CUDA)
+    target_sources(sam3 PRIVATE coreml/sam3_preproc.cu)
+    set_source_files_properties(coreml/sam3_preproc.cu PROPERTIES LANGUAGE CUDA)
+    set_property(SOURCE coreml/sam3_preproc.cu APPEND PROPERTY COMPILE_OPTIONS "-fmad=false")
+    target_compile_definitions(sam3 PRIVATE SAM3_PREPROC_CUDA)
+endif()
 target_include_directories(sam3 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/stb
