@@ -18,6 +18,13 @@
 #include "ggml-vulkan.h"
 #endif
 
+// RFD 0011 (NVIDIA fast-path): ggml-CUDA backend for NVIDIA GPUs (SAM3_CUDA →
+// GGML_CUDA → GGML_USE_CUDA). The model loader selects it below, preferred over
+// Vulkan when both are compiled (a fat build).
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 /* stb (implementation compiled here -- order is pinned) */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -928,6 +935,220 @@ struct edgetam_perceiver {
 };
 
 /*****************************************************************************
+** Stage-transport driver (CUDA device residency)
+**
+** report/CUDA-RESIDENCY-DESIGN.md (trackbench Windows port). The CLAUDE.md
+** stage-isolation pattern moves inter-stage tensors through CPU-side
+** std::vector buffers — free on Apple unified memory, ~231 MB/frame over
+** PCIe on a discrete NVIDIA card (~95% of GPU time measured as memcpy).
+** This driver changes ONLY the transport between stages:
+**   HOST   (default on EVERY backend): today's exact instruction sequence —
+**          ggml_backend_tensor_get into a temp vector + tensor_set. The mac
+**          Metal/CoreML path is byte-identical by construction.
+**   DEVICE (CUDA only, opt-in via SAM3_STAGE_TRANSPORT=device): one
+**          same-backend D2D ggml_backend_tensor_copy — byte-identical
+**          destination bytes, zero PCIe. In-tree precedent: the encoder's
+**          steady-state FPN → state.neck_trk copy.
+** Graph isolation (CLAUDE.md rules 1-2) is untouched: per-stage graphs and
+** fresh input leaves stay; only HOW bytes reach those leaves changes.
+*****************************************************************************/
+
+enum sam3_transport_kind { SAM3_TRANSPORT_HOST = 0, SAM3_TRANSPORT_DEVICE = 1 };
+
+#if defined(GGML_USE_CUDA) && defined(SAM3_PREPROC_CUDA)
+// STEP-5 device frame preprocess (coreml/sam3_preproc.cu): bit-exact CUDA
+// twin of sam3_resize_bilinear + ImageNet normalize, writing f32 CHW into
+// the encoder input tensor's device memory. Host-synchronizes internally.
+extern "C" bool sam3_cuda_preprocess_imagenet(const uint8_t* rgb, int src_w, int src_h,
+                                              float* dst_dev, int img_size);
+#endif
+
+struct sam3_transport {
+    sam3_transport_kind kind    = SAM3_TRANSPORT_HOST;
+    ggml_backend_t      backend = nullptr;
+};
+
+static bool sam3_same_layout(const struct ggml_tensor* a, const struct ggml_tensor* b) {
+    if (a->type != b->type) return false;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i)
+        if (a->ne[i] != b->ne[i] || a->nb[i] != b->nb[i]) return false;
+    return true;
+}
+
+// Persistent tensor -> fresh graph-input tensor. Device mode pre-checks and
+// DEGRADES to the verbatim host path with a once-per-site stderr line instead
+// of aborting — a silently degraded site is then caught by the per-increment
+// nsys transfer-count assert as count drift, never as wrongness.
+static void sam3_stage_feed(const sam3_transport& tr, struct ggml_tensor* src,
+                            struct ggml_tensor* dst, const char* site) {
+    GGML_ASSERT(ggml_nbytes(src) == ggml_nbytes(dst));
+    if (tr.kind == SAM3_TRANSPORT_DEVICE) {
+        if (sam3_same_layout(src, dst) &&
+            !ggml_backend_buffer_is_host(src->buffer) &&
+            !ggml_backend_buffer_is_host(dst->buffer)) {
+            // Async same-backend D2D (increment 5): queued on the backend's
+            // compute stream, so FIFO ordering serializes it before the
+            // graph_compute that consumes dst — no per-copy fence needed.
+            // Every feed source is long-lived (persistent state / ring /
+            // twins, or a graph output whose gallocr outlives the consuming
+            // compute), so the async copy can never read recycled memory.
+            ggml_backend_tensor_copy_async(tr.backend, tr.backend, src, dst);
+            return;
+        }
+        static std::map<std::string, bool> warned;
+        if (!warned[site]) {
+            warned[site] = true;
+            fprintf(stderr, "sam3_stage_feed: %s: layout/buffer mismatch — using host path\n", site);
+        }
+    }
+    std::vector<float> tmp(ggml_nbytes(src) / sizeof(float));
+    ggml_backend_tensor_get(src, tmp.data(), 0, ggml_nbytes(src));
+    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+}
+
+// Residency handle for values that today live in host vectors (increment 2).
+// The EXISTING host vector remains the value and keeps its name/type/owner;
+// the stagebuf only ADDS a persistent device twin beside it. HOST mode never
+// touches the twin — the push is verbatim today's ggml_backend_tensor_set.
+// DEVICE mode uploads the host value into the twin only when its content
+// generation changes (constants: once), then D2D-copies twin -> fresh input.
+struct sam3_stagebuf {
+    struct ggml_context*  ctx = nullptr;  // owns dev's metadata (no_alloc)
+    struct ggml_tensor*   dev = nullptr;  // persistent device twin
+    ggml_backend_buffer_t buf = nullptr;  // owns dev's storage
+    size_t   nbytes = 0;
+    uint64_t gen    = (uint64_t)-1;       // content generation last uploaded
+};
+
+static void sam3_stagebuf_release(sam3_stagebuf& sb) {
+    if (sb.buf) ggml_backend_buffer_free(sb.buf);
+    if (sb.ctx) ggml_free(sb.ctx);
+    sb.ctx = nullptr; sb.dev = nullptr; sb.buf = nullptr;
+    sb.nbytes = 0; sb.gen = (uint64_t)-1;
+}
+
+// Feed a graph-input leaf from a host-side value. `gen` keys the twin's
+// content: pass a counter that increments whenever the host value is
+// recomputed (PE-cache generations); size changes (e.g. rope_k during the
+// memory-bank ramp) re-shape the twin automatically.
+static void sam3_stagebuf_push(const sam3_transport& tr, sam3_stagebuf& sb,
+                               const void* host, size_t nbytes,
+                               struct ggml_tensor* dst, uint64_t gen, const char* site) {
+    if (tr.kind != SAM3_TRANSPORT_DEVICE) {
+        ggml_backend_tensor_set(dst, host, 0, nbytes);  // verbatim host path
+        return;
+    }
+    GGML_ASSERT(nbytes == ggml_nbytes(dst));
+    if (sb.dev && (sb.nbytes != nbytes || !sam3_same_layout(sb.dev, dst)))
+        sam3_stagebuf_release(sb);
+    if (!sb.dev) {
+        struct ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
+        sb.ctx = ggml_init(ip);
+        sb.dev = sb.ctx ? ggml_dup_tensor(sb.ctx, dst) : nullptr;
+        sb.buf = sb.dev ? ggml_backend_alloc_ctx_tensors(sb.ctx, tr.backend) : nullptr;
+        if (!sb.buf || ggml_backend_buffer_is_host(sb.dev->buffer)) {
+            static std::map<std::string, bool> warned;
+            if (!warned[site]) {
+                warned[site] = true;
+                fprintf(stderr, "sam3_stagebuf_push: %s: twin alloc failed — using host path\n", site);
+            }
+            sam3_stagebuf_release(sb);
+            ggml_backend_tensor_set(dst, host, 0, nbytes);
+            return;
+        }
+        sb.nbytes = nbytes;
+        sb.gen    = (uint64_t)-1;
+    }
+    if (sb.gen != gen) {
+        ggml_backend_tensor_set(sb.dev, host, 0, nbytes);  // one upload per content change
+        sb.gen = gen;
+    }
+    // Async D2D from the persistent twin (increment 5) — same-stream FIFO
+    // orders it before the consuming graph_compute; the twin never moves.
+    ggml_backend_tensor_copy_async(tr.backend, tr.backend, sb.dev, dst);
+}
+
+// Increment 6 (CLAUDE.md graph-isolation addendum 4): a stage's cached
+// ggml_context + cgraph + gallocr, kept alive across frames on the CUDA
+// device driver and recomputed in place. Keyed on every topology-affecting
+// shape/config; released + rebuilt on any key change. Stable node/leaf data
+// pointers are what let ggml-CUDA's graph capture reach steady replay, and
+// keeping the gallocr kills the per-frame cudaMalloc/free churn. The host
+// driver never touches these — it keeps the verbatim build→compute→free.
+struct sam3_prop_gcache {
+    struct ggml_context* ctx    = nullptr;
+    struct ggml_cgraph*  graph  = nullptr;
+    struct ggml_gallocr* galloc = nullptr;
+    uint64_t             key    = 0;
+    // input leaves (subset used depends on the cached configuration)
+    struct ggml_tensor *curr_in = nullptr, *src_pos = nullptr,
+                       *prompt = nullptr, *prompt_pos = nullptr,
+                       *rope_q = nullptr, *rope_k = nullptr,
+                       *sparse = nullptr, *image_pe = nullptr, *dense = nullptr,
+                       *trk_s0 = nullptr, *trk_s1 = nullptr,
+                       *tpos = nullptr, *ptr = nullptr, *ptr_pos = nullptr,
+                       *slot_feat[16] = {}, *slot_pe[16] = {};
+    // outputs
+    struct ggml_tensor *masks = nullptr, *iou = nullptr, *obj = nullptr,
+                       *sam_token = nullptr, *mask_tokens = nullptr;
+};
+
+static void sam3_prop_gcache_release(sam3_prop_gcache& gc) {
+    if (gc.galloc) ggml_gallocr_free(gc.galloc);
+    if (gc.ctx) ggml_free(gc.ctx);
+    gc = sam3_prop_gcache();
+}
+
+// Generic small-stage cache (same addendum-4 contract as sam3_prop_gcache)
+// for stages with few leaves: image encoder, memory encoder, perceiver 1D/2D.
+struct sam3_stage_gcache {
+    struct ggml_context* ctx    = nullptr;
+    struct ggml_cgraph*  graph  = nullptr;
+    struct ggml_gallocr* galloc = nullptr;
+    uint64_t             key    = 0;
+    struct ggml_tensor*  in[3]  = {};
+    struct ggml_tensor*  out[4] = {};  // encoder has 4 FPN outputs
+};
+
+static void sam3_stage_gcache_release(sam3_stage_gcache& gc) {
+    if (gc.galloc) ggml_gallocr_free(gc.galloc);
+    if (gc.ctx) ggml_free(gc.ctx);
+    gc = sam3_stage_gcache();
+}
+
+// FNV-style mix for graph-cache keys.
+static inline void sam3_key_mix(uint64_t& k, uint64_t v) {
+    k ^= v + 0x9e3779b97f4a7c15ull + (k << 6) + (k >> 2);
+}
+
+// Resolved once at model load, after the backend chain (Metal>CUDA>Vulkan>CPU).
+// Default host on every backend; device only when explicitly requested AND the
+// answered backend is CUDA — Metal can never pass this gate, so the mac cannot
+// select the device driver under any configuration.
+static void sam3_transport_init(sam3_transport& tr, ggml_backend_t backend) {
+    tr.backend = backend;
+    tr.kind    = SAM3_TRANSPORT_HOST;
+    const char* env = getenv("SAM3_STAGE_TRANSPORT");
+    const bool force_host  = env && strcmp(env, "host") == 0;
+    const bool want_device = env && strcmp(env, "device") == 0;
+    (void)force_host; (void)want_device;
+#ifdef GGML_USE_CUDA
+    // Increment 5: device is the DEFAULT on CUDA (SAM3_STAGE_TRANSPORT=host is
+    // the escape hatch). This flip lives inside ggml_backend_is_cuda, which
+    // Metal/Vulkan/CPU can never pass — every other backend stays host.
+    if (!force_host && ggml_backend_is_cuda(backend)) {
+        tr.kind = SAM3_TRANSPORT_DEVICE;
+        fprintf(stderr, "%s: stage transport = device (CUDA-resident%s)\n", __func__,
+                want_device ? "" : ", default");
+        if (getenv("SAM3_GGML_ENCODER_AHEAD"))
+            fprintf(stderr, "%s: note: encoder-ahead handoff stays host-float until its copy_async clause lands\n", __func__);
+    }
+#endif
+    if (want_device && tr.kind != SAM3_TRANSPORT_DEVICE)
+        fprintf(stderr, "%s: SAM3_STAGE_TRANSPORT=device requested but backend is not CUDA; using host\n", __func__);
+}
+
+/*****************************************************************************
 ** Top-Level Opaque Types (defined here, forward-declared in sam3.h)
 *****************************************************************************/
 
@@ -981,6 +1202,23 @@ struct sam3_model {
     ggml_backend_t          backend = nullptr;
     ggml_backend_buffer_t   buffer  = nullptr;
 
+    // stage-transport driver (host default everywhere; CUDA device opt-in)
+    sam3_transport          transport;
+
+    // Device-transport weight caches (increment 2): host copies of the small
+    // immutable weights that per-frame CPU logic re-reads from the device
+    // every frame (obj-ptr MLP + no_obj_ptr, perceiver latents, maskmem tpos).
+    // Populated ONCE at load and ONLY when transport == device; empty on the
+    // host driver, so every per-frame read stays verbatim today's sequence.
+    // Each cache replicates its consuming site's exact read (sam3_read_f32
+    // for converted weights, raw tensor_get for no_obj_ptr).
+    struct {
+        std::vector<float> objptr_w[3], objptr_b[3], no_obj_ptr;
+        std::vector<float> perc_latents_1d, perc_latents_2d;
+        std::vector<float> tpos;
+        std::vector<float> tpos_proj_w, tpos_proj_b;  // obj_ptr_tpos_proj (inc 3)
+    } wcache;
+
     // tensor lookup
     std::map<std::string, struct ggml_tensor*> tensors;
 
@@ -1020,6 +1258,15 @@ struct sam3_state {
     float no_mask_emb_cache[256]    = {};
     std::vector<float> dense_pe_cache;      // [D * H * H] -- PE grid
     std::vector<float> dense_nomask_cache;  // [D * H * H] -- no-mask tiled
+
+    // Stage-transport device twins for the PE-cache constants (increment 2).
+    // Inert on the host driver; content keyed on pe_cache_gen (bumped whenever
+    // sam3_populate_pe_cache actually recomputes). Freed in sam3_free_state.
+    uint64_t     pe_cache_gen = 0;
+    sam3_stagebuf tw_sparse, tw_image_pe, tw_dense;
+
+    // Increment 6c: cached image-encoder stage graph (device driver only).
+    sam3_stage_gcache gc_encoder;
 };
 
 /*
@@ -1057,6 +1304,12 @@ struct sam3_masklet {
 struct sam3_memory_slot {
     struct ggml_tensor* spatial_feats  = nullptr;  // [64, 72, 72]
     struct ggml_tensor* spatial_pe     = nullptr;  // [64, 72, 72]
+    // Increment 3 (fixed ring): the backend buffer holding BOTH tensors above,
+    // recorded so eviction can recycle the pair instead of leaking it until
+    // reset (~263 KB VRAM per credible frame) and so tensor metadata stops
+    // accreting in tracker.ctx. Null for slots stored by paths that predate
+    // the ring (CoreML store) — those simply aren't recycled.
+    ggml_backend_buffer_t buf          = nullptr;
     int                 frame_index    = -1;
     bool                is_cond_frame  = false;
     // RFD 0011 U3: per-slot bbox + quality recorded at the time this memory
@@ -1130,7 +1383,83 @@ struct sam3_tracker {
 
     // EdgeTAM-specific: RoPE for 16x16 grid (cross-attn K on perceiver 2D latents)
     std::vector<float> cached_axial_cis_k16_reord; // [2, 128, 256] for 16x16 grid
+
+    // Stage-transport device twins for the propagate constants (increment 2).
+    // Inert on the host driver; content keyed on pe_gen (bumped whenever
+    // sam3_ensure_tracker_pe_caches recomputes). rope_k's content is a pure
+    // function of (k16 cache, M_spatial) — the twin auto-reshapes on size
+    // change, so pe_gen keys it too. Freed with owned_buffers on reset.
+    uint64_t     pe_gen = 0;
+    sam3_stagebuf tw_rope_q, tw_rope_k, tw_src_pos;
+    // Increment 4: perceiver-input twins (pos = cached_sinpe_64 keyed on
+    // pe_gen; latents are immutable weights, gen fixed at 1)
+    sam3_stagebuf tw_perc_pos, tw_perc_lat1, tw_perc_lat2;
+
+    // Increment 3: recycling free-lists for bank-slot / obj-ptr device tensors.
+    // Evicted slots return their tensor pair + buffer here; the next store
+    // reuses them in place (fixes the eviction VRAM leak, stops per-frame
+    // cudaMalloc churn, and keeps leaf data pointers frame-invariant for
+    // CUDA-graph capture). Buffers are ALSO in owned_buffers, which remains
+    // the single point of freeing on reset — these lists never free.
+    struct sam3_slot_rec { struct ggml_tensor* feats; struct ggml_tensor* pe; ggml_backend_buffer_t buf; };
+    struct sam3_ptr_rec  { struct ggml_tensor* pt; ggml_backend_buffer_t buf; };
+    std::vector<sam3_slot_rec> slot_free;
+    std::vector<sam3_ptr_rec>  ptr_free;
+
+    // Increment 3: host mirror of stored object pointers, strictly parallel to
+    // ptr_banks (same push/trim/erase). The device prompt assembly reads these
+    // instead of doing 16 per-frame 1 KB D2H gets. The values pass through the
+    // host at store time anyway, so this costs one memcpy per credible frame.
+    std::map<int, std::vector<std::vector<float>>> ptr_host;
+
+    // Increment 6: cached propagate (mem-attn + decoder) stage graph.
+    sam3_prop_gcache gc_prop;
+    // Increment 6b: cached memory-encoder + perceiver sub-graphs.
+    sam3_stage_gcache gc_memenc, gc_perc1, gc_perc2;
 };
+
+// Increment 3: acquire a bank-slot tensor pair (feats + pe sharing one backend
+// buffer), reusing a recycled pair when the dims match; otherwise allocate and
+// track the new buffer in owned_buffers exactly as the old per-frame path did.
+// Returns false only on allocation failure.
+static bool sam3_acquire_slot_pair(sam3_tracker& tracker, const sam3_model& model,
+                                   int64_t ne0, int64_t ne1, int64_t ne2,
+                                   struct ggml_tensor** out_feats,
+                                   struct ggml_tensor** out_pe,
+                                   ggml_backend_buffer_t* out_buf) {
+    for (size_t i = 0; i < tracker.slot_free.size(); ++i) {
+        auto& r = tracker.slot_free[i];
+        if (r.feats && r.feats->ne[0] == ne0 && r.feats->ne[1] == ne1 &&
+            r.feats->ne[2] == ne2 && r.feats->ne[3] == 1) {
+            *out_feats = r.feats; *out_pe = r.pe; *out_buf = r.buf;
+            tracker.slot_free.erase(tracker.slot_free.begin() + i);
+            return true;
+        }
+    }
+    if (!tracker.ctx) {
+        struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
+        tracker.ctx = ggml_init(tp);
+    }
+    const size_t nbytes = (size_t)ne0 * ne1 * ne2 * sizeof(float);
+    auto* feats = ggml_new_tensor_3d(tracker.ctx, GGML_TYPE_F32, ne0, ne1, ne2);
+    auto* pe    = ggml_new_tensor_3d(tracker.ctx, GGML_TYPE_F32, ne0, ne1, ne2);
+    auto* buf   = ggml_backend_alloc_buffer(model.backend, 2 * nbytes + 512);
+    if (!feats || !pe || !buf) {
+        if (buf) ggml_backend_buffer_free(buf);
+        return false;
+    }
+    struct ggml_tallocr ta = ggml_tallocr_new(buf);
+    ggml_tallocr_alloc(&ta, feats);
+    ggml_tallocr_alloc(&ta, pe);
+    tracker.owned_buffers.push_back(buf);
+    *out_feats = feats; *out_pe = pe; *out_buf = buf;
+    return true;
+}
+
+static void sam3_recycle_slot(sam3_tracker& tracker, const sam3_memory_slot& slot) {
+    if (slot.buf && slot.spatial_feats && slot.spatial_pe)
+        tracker.slot_free.push_back({slot.spatial_feats, slot.spatial_pe, slot.buf});
+}
 
 // Resolve effective img_size / feat_size from state (which may override hp defaults).
 static int sam3_eff_img_size(const sam3_state& s, const sam3_hparams& hp) {
@@ -3431,12 +3760,47 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         model->backend = ggml_backend_metal_init();
     }
 #endif
+#ifdef GGML_USE_CUDA
+    // NVIDIA fast-path. ggml-CUDA runs the EdgeTAM graph with tensor-core FP16
+    // kernels, CUDA graphs, and FlashAttention. Preferred over Vulkan when both are
+    // compiled in (a fat NVIDIA build). device 0 = first CUDA GPU. The device-count
+    // guard + log-AFTER-init make the runtime fallback chain (CUDA → Vulkan → CPU)
+    // observable and honest: a machine without an NVIDIA device/driver (or with a
+    // CUDA 12/13 lib mismatch) logs the fallback instead of claiming CUDA ran
+    // (cf. Egor part-2: "always check which provider ran").
+    if (params.use_gpu && !model->backend) {
+        if (ggml_backend_cuda_get_device_count() > 0) {
+            model->backend = ggml_backend_cuda_init(0);
+        }
+        if (model->backend) {
+            fprintf(stderr, "%s: using CUDA backend (%s)\n", __func__, ggml_backend_name(model->backend));
+        } else {
+            fprintf(stderr, "%s: CUDA backend unavailable (no NVIDIA device/driver) — falling back\n", __func__);
+        }
+    }
+#endif
 #ifdef GGML_USE_VULKAN
     // RFD 0011: cross-vendor GPU. ggml-Vulkan runs the same EdgeTAM graph on any
     // Vulkan device (AMD/NVIDIA/Intel; Apple via MoltenVK). device 0 = first GPU.
+    // ggml-Vulkan THROWS (vk::SystemError) when the Vulkan loader/driver is absent
+    // or pre-1.2 — both the device-count probe and init are wrapped so a GPU-less
+    // machine falls through to the CPU backend instead of failing the model load.
     if (params.use_gpu && !model->backend) {
-        fprintf(stderr, "%s: using Vulkan backend\n", __func__);
-        model->backend = ggml_backend_vk_init(0);
+        try {
+            if (ggml_backend_vk_get_device_count() > 0) {
+                model->backend = ggml_backend_vk_init(0);
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr, "%s: Vulkan probe failed (%s)\n", __func__, e.what());
+            model->backend = nullptr;
+        } catch (...) {
+            model->backend = nullptr;
+        }
+        if (model->backend) {
+            fprintf(stderr, "%s: using Vulkan backend (%s)\n", __func__, ggml_backend_name(model->backend));
+        } else {
+            fprintf(stderr, "%s: Vulkan backend unavailable (no Vulkan device/driver) — falling back\n", __func__);
+        }
     }
 #endif
     if (!model->backend) {
@@ -3447,6 +3811,7 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         fprintf(stderr, "%s: failed to init backend\n", __func__);
         return nullptr;
     }
+    sam3_transport_init(model->transport, model->backend);
 
     // ── Create ggml context (no_alloc — we use backend_alloc_ctx_tensors)
     // Estimate: ~3000 tensors, generous overhead
@@ -3500,6 +3865,47 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
         fprintf(stderr, "%s: visual-only model — skipping tokenizer\n", __func__);
     }
 
+    // Device-transport weight caches (increment 2): read each small immutable
+    // weight ONCE now instead of every frame. Device driver only — on the
+    // host driver the caches stay empty and the per-frame reads are verbatim.
+    if (model->transport.kind == SAM3_TRANSPORT_DEVICE) {
+        const int D  = model->hparams.neck_dim;
+        const int MD = model->hparams.mem_out_dim;
+        for (int j = 0; j < 3; ++j) {
+            if (model->obj_ptr_proj_w[j] && model->obj_ptr_proj_b[j]) {
+                const int nel_w = (int)(model->obj_ptr_proj_w[j]->ne[0] * model->obj_ptr_proj_w[j]->ne[1]);
+                model->wcache.objptr_w[j].resize(nel_w);
+                sam3_read_f32(model->obj_ptr_proj_w[j], model->wcache.objptr_w[j].data(), nel_w);
+                model->wcache.objptr_b[j].resize(D);
+                sam3_read_f32(model->obj_ptr_proj_b[j], model->wcache.objptr_b[j].data(), D);
+            }
+        }
+        if (model->no_obj_ptr) {
+            model->wcache.no_obj_ptr.resize(D);
+            ggml_backend_tensor_get(model->no_obj_ptr, model->wcache.no_obj_ptr.data(), 0, D * sizeof(float));
+        }
+        if (model->hparams.has_perceiver && model->perceiver.latents_1d && model->perceiver.latents_2d) {
+            const int n1 = (int)(model->perceiver.latents_1d->ne[0] * model->perceiver.latents_1d->ne[1]);
+            const int n2 = (int)(model->perceiver.latents_2d->ne[0] * model->perceiver.latents_2d->ne[1]);
+            model->wcache.perc_latents_1d.resize(n1);
+            sam3_read_f32(model->perceiver.latents_1d, model->wcache.perc_latents_1d.data(), n1);
+            model->wcache.perc_latents_2d.resize(n2);
+            sam3_read_f32(model->perceiver.latents_2d, model->wcache.perc_latents_2d.data(), n2);
+        }
+        if (model->mem_enc.tpos[0]) {
+            model->wcache.tpos.resize(MD * model->hparams.num_maskmem);
+            sam3_read_f32(model->mem_enc.tpos[0], model->wcache.tpos.data(),
+                          MD * model->hparams.num_maskmem);
+        }
+        if (model->obj_ptr_tpos_w && model->obj_ptr_tpos_b) {
+            model->wcache.tpos_proj_w.resize(D * MD);
+            sam3_read_f32(model->obj_ptr_tpos_w, model->wcache.tpos_proj_w.data(), D * MD);
+            model->wcache.tpos_proj_b.resize(MD);
+            sam3_read_f32(model->obj_ptr_tpos_b, model->wcache.tpos_proj_b.data(), MD);
+        }
+        fprintf(stderr, "%s: device-transport weight caches populated\n", __func__);
+    }
+
     fprintf(stderr, "%s: model loaded successfully\n", __func__);
     return model;
 }
@@ -3517,6 +3923,13 @@ void sam3_free_model(sam3_model& model) {
         ggml_backend_free(model.backend);
         model.backend = nullptr;
     }
+}
+
+const char* sam3_backend_name(const sam3_model& model) {
+    // ggml_backend_name returns a static string owned by ggml; safe to hand across
+    // the C-ABI without copying. model.backend is set by sam3_load_model's
+    // preference chain (CUDA/Vulkan/Metal/CPU).
+    return model.backend ? ggml_backend_name(model.backend) : "none";
 }
 
 bool sam3_is_visual_only(const sam3_model& model) {
@@ -3572,6 +3985,11 @@ void sam3_state_set_orig_dims(sam3_state& state, int w, int h) {
 }
 
 void sam3_free_state(sam3_state& state) {
+    // Stage-transport twins (increment 2) + cached encoder graph (increment 6c)
+    sam3_stagebuf_release(state.tw_sparse);
+    sam3_stagebuf_release(state.tw_image_pe);
+    sam3_stagebuf_release(state.tw_dense);
+    sam3_stage_gcache_release(state.gc_encoder);
     if (state.galloc) {
         ggml_gallocr_free(state.galloc);
         state.galloc = nullptr;
@@ -3866,6 +4284,43 @@ static struct ggml_tensor* sam3_apply_rope(struct ggml_context* ctx,
     return ggml_reshape_3d(ctx, ggml_cont(ctx, out), head_dim, N, nheads_B);
 }
 
+// ── CUDA flash-attn head-dim fallback (Windows x64 + CUDA port) ──────────────
+// ggml-CUDA's fused flash-attention kernels only cover head sizes
+// {40,64,72,80,96,112,128,256,576} (ggml-cuda/fattn.cu). EdgeTAM's SAM
+// mask-decoder attention uses head_dim=32, for which the CUDA selector returns
+// BEST_FATTN_KERNEL_NONE and GGML_ABORTs. Metal and Vulkan accept head_dim=32,
+// so this is a CUDA-only gap — NOT a model/graph change. On the CUDA build ONLY
+// we route the unsupported head dims through a mathematically equivalent manual
+// attention (the exact idiom the fork already uses for the fp32-mask path in
+// sam3_ddec_layer_forward): QK^T → soft_max_ext(scale,+mask) → ·V, laid out to
+// match ggml_flash_attn_ext's [HD, NH, N_q, B] output so every call site is
+// unchanged. On non-CUDA builds this forwards verbatim to ggml_flash_attn_ext,
+// so the Metal/CoreML path and its numerics are byte-for-byte untouched.
+static struct ggml_tensor* sam3_fa_ext(struct ggml_context* ctx,
+                                       struct ggml_tensor* q,     // [HD, N_q,  NH,    B]
+                                       struct ggml_tensor* k,     // [HD, N_kv, NH_kv, B]
+                                       struct ggml_tensor* v,     // [HD, N_kv, NH_kv, B]
+                                       struct ggml_tensor* mask,  // additive [N_kv, N_q, ...] or null
+                                       float scale, float max_bias, float logit_softcap) {
+#ifdef GGML_USE_CUDA
+    const int64_t hd = q->ne[0];
+    const bool fa_ok =
+        (hd == 40 || hd == 64 || hd == 72 || hd == 80 || hd == 96 ||
+         hd == 112 || hd == 128 || hd == 256 || hd == 576) &&
+        k->ne[0] == hd && v->ne[0] == hd &&
+        max_bias == 0.0f && logit_softcap == 0.0f;
+    if (!fa_ok) {
+        struct ggml_tensor* kq = ggml_mul_mat(ctx, k, q);                 // [N_kv, N_q, NH, B]
+        kq = ggml_soft_max_ext(ctx, kq, mask, scale, max_bias);           // softmax(scale*kq + mask)
+        struct ggml_tensor* v_t = ggml_cont(ctx, ggml_transpose(ctx, v)); // [N_kv, HD, NH_kv, B]
+        struct ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq);             // [HD, N_q, NH, B]
+        kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));         // [HD, NH, N_q, B]
+        return kqv;
+    }
+#endif
+    return ggml_flash_attn_ext(ctx, q, k, v, mask, scale, max_bias, logit_softcap);
+}
+
 // Single ViT block forward: pre-norm → attn (window or global, with RoPE) → residual → pre-norm → MLP → residual
 // x: [E, W, H, B] in ggml layout (following sam.cpp convention)
 static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
@@ -3932,7 +4387,7 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
         K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* attn_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         // flash_attn_ext returns [HD, NH, N, B_cur] — HD and NH adjacent,
         // so reshaping directly to [E, W, H, B] is correct.
         x = ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur);
@@ -4152,7 +4607,7 @@ static struct ggml_tensor* sam3_text_block_forward(struct ggml_context* ctx,
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous; flash_attn uses strides
 
     float scale = 1.0f / sqrtf((float)HD);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, causal_mask, scale, 0.0f, 0.0f);
+    auto* attn_out = sam3_fa_ext(ctx, Q, K, V, causal_mask, scale, 0.0f, 0.0f);
     x = ggml_reshape_2d(ctx, attn_out, E, L);
 
     x = ggml_mul_mat(ctx, blk.attn_out_proj_w, x);
@@ -4553,7 +5008,7 @@ static struct ggml_tensor* sam2_hiera_block_forward(struct ggml_context* ctx,
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // non-contiguous OK for flash_attn
 
     float scale = 1.0f / sqrtf((float)head_dim);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
+    auto* attn_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0, 0);
 
     // Recombine: flash_attn output is [HD, N_q, NH, B_win]
     // → reshape to [C_out, N_q, B_win]
@@ -4986,29 +5441,27 @@ static void edgetam_build_repvit_graph(struct ggml_context* ctx,
     }
 }
 
-#ifdef SAM3_COREML
-#include "edgetam_coreml.h"
-
-// RFD 0011 U8 (threaded encoder-ahead): the producer thread runs preprocess +
-// CoreML encode for frame N+1 into s_prefetch_neck while the main thread runs the
-// consumer (assembly+memattn+decode+memencode+bank) for frame N. When a prefetched
-// neck is ready, the main thread's encode step copies it (skipping BOTH preprocess
-// and the CoreML encode), so the ~17 ms encoder leg overlaps the ~52 ms consumer.
-// SPSC: the bench serializes set→consume per frame, so no lock is needed here.
+// ── RFD 0011: prefetched-neck seam (backend-agnostic) ────────────────────────
+// Threaded encoder-ahead: a PRODUCER thread runs preprocess + encode for frame
+// N+1 into s_prefetch_neck while the main thread runs the consumer
+// (assembly+memattn+decode+memencode+bank) for frame N. When a prefetched neck
+// is ready, the main thread's encode step copies it (skipping BOTH preprocess
+// and the encode), so the encoder leg overlaps the consumer. The producer engine
+// is CoreML on Apple (edgetam_coreml_encode) and a SECOND ggml backend instance
+// on CUDA (sam3_encoder_ahead_encode) — the seam itself is raw float arrays with
+// no backend dependency. Function names keep the historic sam3_coreml_ prefix
+// for source compatibility with the existing capi + threaded benches.
+// SPSC: the consumer thread is the only reader AND the only caller of
+// sam3_coreml_set_prefetched_neck (per the capi contract), so no lock is needed.
+// Fixed EdgeTAM@1024 contract: levels 256/128/64 x 256ch.
 static std::vector<float> s_prefetch_neck[3];
 static bool s_prefetch_ready = false;
 
-// RFD 0011 U8 — per-chip CoreML compute-unit profile (0=ALL 1=ANE 2=GPU 3=CPU).
-// M4 Pro sweep (sam3_coreml_pipeline, isolated 20-rep median): encoder ANE 11ms
-// (GPU 14, CPU 38), mem-attn GPU 17ms (ANE 26, CPU 24), decoder ANE 7.8ms (GPU 8.2),
-// memenc ANE 5.0 / GPU 3.9. Defaults = the validated M4 optimum (enc ANE, mem-attn
-// GPU, decoder ANE, memenc ANE — memenc's isolated GPU edge washes out in thermal
-// noise end-to-end). NOT inverted vs M1 like the ORT/EfficientTAM stack. Override
-// per chip via env (e.g. SAM3_COREML_MA_UNIT=1) if M1/M2/M3 profiles differ.
-static int sam3_coreml_unit(const char* env, int def) {
-    const char* v = getenv(env);
-    return (v && *v) ? atoi(v) : def;
-}
+// Device-resident prefetch seam (CUDA device transport): the producer's
+// per-slot persistent DEVICE tensors, handed to the consumer as pointers —
+// the consumer D2D-copies them into state.neck_trk instead of round-tripping
+// 2×84 MB of floats through the host. Same SPSC discipline as the host seam.
+static struct { struct ggml_tensor* n[3]; bool ready; } s_prefetch_dev = {{nullptr, nullptr, nullptr}, false};
 
 void sam3_coreml_set_prefetched_neck(const float* n0, const float* n1, const float* n2) {
     const int Wd[3] = {256, 128, 64}, D = 256;
@@ -5020,6 +5473,69 @@ void sam3_coreml_set_prefetched_neck(const float* n0, const float* n1, const flo
 // Exposed for the producer thread (preprocess off the main thread).
 std::vector<float> sam3_coreml_preprocess_image(const sam3_image& image, int img_size) {
     return sam2_preprocess_image(image, img_size);
+}
+
+// Load 3 neck levels (contiguous [D,W,H] floats, EdgeTAM@1024: 256/128/64 x 256ch)
+// into the persistent state tensors, (re)allocating state + the sinusoidal PE on
+// the first frame after create/reset. Factored from the CoreML encode helper so
+// the ggml prefetch-consume path (encoder-ahead on CUDA) loads necks identically.
+// Per rule reference-rules-in-comments: think-in-systems — one load path, two
+// producers (CoreML / second ggml backend).
+static bool edgetam_load_neck_from_floats(sam3_state& state, const sam3_model& model,
+                                          std::vector<float> nbuf[3]) {
+    const int D = model.hparams.neck_dim;      // 256
+    const int Wd[3] = {256, 128, 64};
+    const int Hd[3] = {256, 128, 64};
+    SAM3_TIME_SCOPE(state_update_ms);
+    bool reuse = state.buffer && state.pe_buf && state.neck_trk[0]
+              && state.neck_trk[0]->ne[0] == D && state.neck_trk[0]->ne[1] == Wd[0];
+    if (!reuse) {
+        if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
+        if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
+        if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
+        if (state.ctx)    { ggml_free(state.ctx);    state.ctx = nullptr; }
+        struct ggml_init_params sp = {ggml_tensor_overhead() * 32, nullptr, true};
+        state.ctx = ggml_init(sp);
+        for (int i = 0; i < 3; ++i) {
+            state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
+            char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_%d", i); ggml_set_name(state.neck_trk[i], nm);
+        }
+        state.neck_trk[3] = nullptr;
+        state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+        // Positional encoding (same as the ggml path: sinusoidal_pe_2d(H, W, D)).
+        struct ggml_init_params pp = {ggml_tensor_overhead() * 16, nullptr, true};
+        state.pe_ctx = ggml_init(pp);
+        for (int i = 0; i < 3; ++i) {
+            state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
+            char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_pe_%d", i); ggml_set_name(state.neck_trk_pe[i], nm);
+        }
+        state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
+        for (int i = 0; i < 3; ++i) {
+            auto pe = sam3_sinusoidal_pe_2d(Hd[i], Wd[i], D);
+            ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
+        }
+    }
+    // Contiguous [D,W,H] floats load with a DIRECT copy — no per-frame transpose
+    // (CoreML exports channels-last [1,H,W,D] whose bytes are identical; a ggml
+    // producer's ggml_backend_tensor_get output is already in this layout).
+    for (int i = 0; i < 3; ++i)
+        ggml_backend_tensor_set(state.neck_trk[i], nbuf[i].data(), 0, nbuf[i].size() * sizeof(float));
+    return true;
+}
+
+#ifdef SAM3_COREML
+#include "edgetam_coreml.h"
+
+// RFD 0011 U8 — per-chip CoreML compute-unit profile (0=ALL 1=ANE 2=GPU 3=CPU).
+// M4 Pro sweep (sam3_coreml_pipeline, isolated 20-rep median): encoder ANE 11ms
+// (GPU 14, CPU 38), mem-attn GPU 17ms (ANE 26, CPU 24), decoder ANE 7.8ms (GPU 8.2),
+// memenc ANE 5.0 / GPU 3.9. Defaults = the validated M4 optimum (enc ANE, mem-attn
+// GPU, decoder ANE, memenc ANE — memenc's isolated GPU edge washes out in thermal
+// noise end-to-end). NOT inverted vs M1 like the ORT/EfficientTAM stack. Override
+// per chip via env (e.g. SAM3_COREML_MA_UNIT=1) if M1/M2/M3 profiles differ.
+static int sam3_coreml_unit(const char* env, int def) {
+    const char* v = getenv(env);
+    return (v && *v) ? atoi(v) : def;
 }
 
 // RFD 0011 (CoreML/ANE hybrid): run the EdgeTAM encoder on CoreML/ANE (~12 ms)
@@ -5061,45 +5577,10 @@ static bool edgetam_encode_image_coreml(sam3_state& state, const sam3_model& mod
             return false;
     }
 
-    // Build/refresh the persistent state (U1 reuse) and permute CoreML's
-    // [D,H,W] (NCHW, W innermost) into ggml neck_trk [D,W,H] (D innermost).
-    {
-        SAM3_TIME_SCOPE(state_update_ms);
-        bool reuse = state.buffer && state.pe_buf && state.neck_trk[0]
-                  && state.neck_trk[0]->ne[0] == D && state.neck_trk[0]->ne[1] == Wd[0];
-        if (!reuse) {
-            if (state.buffer) { ggml_backend_buffer_free(state.buffer); state.buffer = nullptr; }
-            if (state.pe_buf) { ggml_backend_buffer_free(state.pe_buf); state.pe_buf = nullptr; }
-            if (state.pe_ctx) { ggml_free(state.pe_ctx); state.pe_ctx = nullptr; }
-            if (state.ctx)    { ggml_free(state.ctx);    state.ctx = nullptr; }
-            struct ggml_init_params sp = {ggml_tensor_overhead() * 32, nullptr, true};
-            state.ctx = ggml_init(sp);
-            for (int i = 0; i < 3; ++i) {
-                state.neck_trk[i] = ggml_new_tensor_4d(state.ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
-                char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_%d", i); ggml_set_name(state.neck_trk[i], nm);
-            }
-            state.neck_trk[3] = nullptr;
-            state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
-            // Positional encoding (same as the ggml path: sinusoidal_pe_2d(H, W, D)).
-            struct ggml_init_params pp = {ggml_tensor_overhead() * 16, nullptr, true};
-            state.pe_ctx = ggml_init(pp);
-            for (int i = 0; i < 3; ++i) {
-                state.neck_trk_pe[i] = ggml_new_tensor_4d(state.pe_ctx, GGML_TYPE_F32, D, Wd[i], Hd[i], 1);
-                char nm[32]; snprintf(nm, sizeof(nm), "neck_trk_pe_%d", i); ggml_set_name(state.neck_trk_pe[i], nm);
-            }
-            state.pe_buf = ggml_backend_alloc_ctx_tensors(state.pe_ctx, model.backend);
-            for (int i = 0; i < 3; ++i) {
-                auto pe = sam3_sinusoidal_pe_2d(Hd[i], Wd[i], D);
-                ggml_backend_tensor_set(state.neck_trk_pe[i], pe.data(), 0, pe.size() * sizeof(float));
-            }
-        }
-        // The CoreML model exports channels-last [1,H,W,D], whose contiguous
-        // bytes are byte-identical to ggml neck_trk [D,W,H] (d innermost, then W,
-        // then H). So each level loads with a DIRECT copy — no per-frame transpose.
-        for (int i = 0; i < 3; ++i)
-            ggml_backend_tensor_set(state.neck_trk[i], nbuf[i].data(), 0, nbuf[i].size() * sizeof(float));
-    }
-    return true;
+    // Build/refresh the persistent state (U1 reuse) and load CoreML's channels-
+    // last [1,H,W,D] output — byte-identical to ggml neck_trk [D,W,H] — via the
+    // shared (backend-agnostic) neck loader.
+    return edgetam_load_neck_from_floats(state, model, nbuf);
 }
 #endif  // SAM3_COREML
 
@@ -5132,13 +5613,68 @@ static bool edgetam_encode_image(sam3_state& state,
     }
 #endif
 
+    // RFD 0011 (ggml encoder-ahead): a producer thread (sam3_encoder_ahead_encode,
+    // a SECOND ggml backend instance — own CUDA stream) already encoded THIS
+    // frame's neck into the prefetch seam. Load it into state and skip the whole
+    // in-line encoder graph, mirroring the CoreML prefetch path above. Guarded to
+    // the seam's fixed EdgeTAM@1024 contract (levels 256/128/64).
+    // Device-resident prefetch (increment 7): the producer already encoded
+    // this frame's neck into per-slot DEVICE tensors — three same-GPU D2D
+    // copies into state and the whole in-line encoder is skipped, with zero
+    // PCIe traffic. Requires the state buffers to exist (always true after
+    // the synchronous seed frame); otherwise falls through to the sync path.
+    if (s_prefetch_dev.ready && hp.is_edgetam() && img_size == 1024 &&
+        model.transport.kind == SAM3_TRANSPORT_DEVICE) {
+        s_prefetch_dev.ready = false;
+        bool ok = state.buffer && state.pe_buf;
+        for (int i = 0; ok && i < 3; ++i)
+            ok = state.neck_trk[i] && s_prefetch_dev.n[i] &&
+                 ggml_nbytes(state.neck_trk[i]) == ggml_nbytes(s_prefetch_dev.n[i]);
+        if (ok) {
+            SAM3_TIME_SCOPE(state_update_ms);
+            for (int i = 0; i < 3; ++i)
+                sam3_stage_feed(model.transport, s_prefetch_dev.n[i],
+                                state.neck_trk[i], "ea_neck");
+            return true;
+        }
+        fprintf(stderr, "%s: device prefetch present but state not primed — sync encode\n", __func__);
+    }
+
+    if (s_prefetch_ready && hp.is_edgetam() && img_size == 1024) {
+        static std::vector<float> nbuf[3];  // consumer-thread-only (SPSC seam)
+        for (int i = 0; i < 3; ++i) nbuf[i].swap(s_prefetch_neck[i]);
+        s_prefetch_ready = false;
+        return edgetam_load_neck_from_floats(state, model, nbuf);
+    }
+
     // ── Preprocess (same ImageNet normalization as SAM2) ─────────────────
     // RFD 0011 U0: preprocess timed separately from the graph build/alloc/compute.
+    // STEP-5 (plan v1): on the CUDA device-transport path the resize+normalize
+    // moves onto the GPU (coreml/sam3_preproc.cu — bit-exact double-chain twin
+    // of sam3_resize_bilinear, -fmad=false) and the 12.6MB f32 upload becomes a
+    // ~2.7MB u8 upload. SAM3_PREPROC_DEVICE: unset/1 = device path when
+    // available; 0 = CPU path (byte-identical shipped behavior); 2 = VERIFY
+    // (both paths, memcmp, abort on mismatch — the byte gate).
     std::vector<float> img_data;
+    bool preproc_on_device = false;
+#if defined(GGML_USE_CUDA) && defined(SAM3_PREPROC_CUDA)
     {
+        const char* pd = getenv("SAM3_PREPROC_DEVICE");
+        const int pd_mode = pd ? atoi(pd) : 1;
+        if (pd_mode != 0 && model.transport.kind == SAM3_TRANSPORT_DEVICE) {
+            preproc_on_device = true;
+            if (pd_mode == 2) {
+                SAM3_TIME_SCOPE(preprocess_ms);
+                img_data = sam2_preprocess_image(image, img_size);  // reference for VERIFY
+            }
+        }
+    }
+#endif
+    if (!preproc_on_device) {
         SAM3_TIME_SCOPE(preprocess_ms);
         img_data = sam2_preprocess_image(image, img_size);
     }
+    (void)preproc_on_device;
 
     // ── Build graph ──────────────────────────────────────────────────────
     // RFD 0011 U0: graph CONSTRUCTION region (image_encoder_build_ms). U1 will
@@ -5149,6 +5685,24 @@ static bool edgetam_encode_image(sam3_state& state,
     struct ggml_tensor* inp = nullptr;
     int n_fpn = 4 - hp.scalp;
     struct ggml_tensor* fpn_outs[4] = {};
+    struct ggml_gallocr* galloc = nullptr;
+
+    // Increment 6c: cached encoder graph (CLAUDE.md addendum 4) — the biggest
+    // per-frame graph; fixed shapes at a given img_size, so steady state hits
+    // every frame and ggml-CUDA graph capture sees stable pointers.
+    const bool use_egc = model.transport.kind == SAM3_TRANSPORT_DEVICE;
+    uint64_t ekey = 1469598103934665603ull;
+    sam3_key_mix(ekey, (uint64_t)img_size);
+    sam3_key_mix(ekey, (uint64_t)n_fpn);
+    auto& egc = state.gc_encoder;
+    const bool egc_hit = use_egc && egc.ctx && egc.key == ekey;
+    if (use_egc && !egc_hit && egc.ctx) sam3_stage_gcache_release(egc);
+
+    if (egc_hit) {
+        ctx0 = egc.ctx; graph = egc.graph; galloc = egc.galloc;
+        inp = egc.in[0];
+        for (int i = 0; i < 4; ++i) fpn_outs[i] = egc.out[i];
+    } else {
     {
         SAM3_TIME_SCOPE(image_encoder_build_ms);
         const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
@@ -5192,7 +5746,7 @@ static bool edgetam_encode_image(sam3_state& state,
     // ── Allocate ─────────────────────────────────────────────────────────
     // RFD 0011 U0: gallocr reserve+alloc region (image_encoder_alloc_ms),
     // separate from build and compute. U1 reuses a pre-reserved allocator here.
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     {
         SAM3_TIME_SCOPE(image_encoder_alloc_ms);
         if (!ggml_gallocr_reserve(galloc, graph)) {
@@ -5209,8 +5763,46 @@ static bool edgetam_encode_image(sam3_state& state,
         }
     }
 
+    if (use_egc) {
+        egc.ctx = ctx0; egc.graph = graph; egc.galloc = galloc; egc.key = ekey;
+        egc.in[0] = inp;
+        for (int i = 0; i < 4; ++i) egc.out[i] = fpn_outs[i];
+    }
+    }  // end build path (egc_hit skips straight to the input upload)
+
     // Set input image
+#if defined(GGML_USE_CUDA) && defined(SAM3_PREPROC_CUDA)
+    if (preproc_on_device) {
+        SAM3_TIME_SCOPE(preprocess_ms);
+        bool pd_ok = sam3_cuda_preprocess_imagenet(image.data.data(), image.width,
+                                                   image.height, (float*)inp->data,
+                                                   img_size);
+        if (!pd_ok) {
+            // Fail-soft: fall back to the CPU path for this frame (log once).
+            static bool pd_warned = false;
+            if (!pd_warned) { fprintf(stderr, "%s: device preprocess failed - CPU fallback\n", __func__); pd_warned = true; }
+            if (img_data.empty()) img_data = sam2_preprocess_image(image, img_size);
+            ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+        } else if (!img_data.empty()) {
+            // VERIFY mode: download the kernel's output and byte-compare.
+            std::vector<float> dev_out(img_data.size());
+            ggml_backend_tensor_get(inp, dev_out.data(), 0, dev_out.size() * sizeof(float));
+            if (memcmp(dev_out.data(), img_data.data(), img_data.size() * sizeof(float)) != 0) {
+                size_t bad = 0, first = (size_t)-1;
+                for (size_t i = 0; i < img_data.size(); ++i)
+                    if (dev_out[i] != img_data[i]) { ++bad; if (first == (size_t)-1) first = i; }
+                fprintf(stderr, "%s: SAM3_PREPROC_DEVICE=2 BYTE GATE FAIL: %zu/%zu floats differ (first %zu: dev %.9g cpu %.9g)\n",
+                        __func__, bad, img_data.size(), first, (double)dev_out[first], (double)img_data[first]);
+                abort();
+            }
+            fprintf(stderr, "%s: SAM3_PREPROC_DEVICE=2 byte gate PASS (%zu floats)\n", __func__, img_data.size());
+        }
+    } else {
+        ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+    }
+#else
     ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+#endif
 
     // ── Compute ──────────────────────────────────────────────────────────
     // RFD 0011 U0: backend compute region (image_encoder_compute_ms). This is
@@ -5219,8 +5811,12 @@ static bool edgetam_encode_image(sam3_state& state,
         SAM3_TIME_SCOPE(image_encoder_compute_ms);
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
             fprintf(stderr, "%s: graph compute failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
+            if (use_egc) {
+                sam3_stage_gcache_release(egc);  // never keep a wedged graph
+            } else {
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx0);
+            }
             return false;
         }
     }
@@ -5321,8 +5917,10 @@ static bool edgetam_encode_image(sam3_state& state,
         }
     }
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
+    if (!use_egc) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+    }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
@@ -5334,6 +5932,194 @@ static bool edgetam_encode_image(sam3_state& state,
     }
 
     return true;
+}
+
+/*****************************************************************************
+** RFD 0011 — ggml encoder-ahead producer (CUDA)
+**
+** The NVIDIA counterpart of the CoreML producer-encoder pool: a SECOND ggml
+** backend instance on the same CUDA device gives the producer thread its own
+** stream + cublas handles, so the frame-N+1 encoder graph overlaps the
+** frame-N consumer (mem-attn/decoder/mem-enc) on the GPU's own scheduler.
+** The weight tensors stay shared (same-device memory, read-only after load).
+**
+** CUDA-only for now: cross-instance buffer reads are unverified on Vulkan,
+** and the M4 compute-unit sweep showed same-accelerator producer/consumer
+** co-location can LOSE (the Mac win came from ANE parallel to GPU) — so this
+** must be A/B-measured on real NVIDIA hardware (the platform encoder-ahead
+** bench) before it can default on. Callers opt in via the capi
+** (SAM3_GGML_ENCODER_AHEAD=1).
+*****************************************************************************/
+
+struct sam3_encoder_ahead {
+    ggml_backend_t backend = nullptr;  // producer-owned second backend instance
+    ggml_gallocr_t galloc  = nullptr;  // producer-owned graph allocator
+
+    // Device seam (increment 7): cached producer graph (addendum-4 contract —
+    // built once, recomputed in place; stable pointers let the producer's own
+    // stream reach CUDA-graph replay) + per-slot persistent neck tensors.
+    static const int SLOTS = 3;        // == EtTracker::POOL
+    struct ggml_context*  gctx  = nullptr;
+    struct ggml_cgraph*   graph = nullptr;
+    struct ggml_tensor*   inp   = nullptr;
+    struct ggml_tensor*   fpn[3] = {};
+    struct ggml_context*  slot_ctx = nullptr;
+    ggml_backend_buffer_t slot_buf = nullptr;
+    struct ggml_tensor*   slot_n[SLOTS][3] = {};
+    bool                  slot_filled[SLOTS] = {};
+};
+
+sam3_encoder_ahead* sam3_encoder_ahead_create(const sam3_model& model) {
+#ifdef GGML_USE_CUDA
+    // A ggml_backend_t is not safe for concurrent graph_compute from two
+    // threads, so the producer gets its own CUDA context (own stream). Weights
+    // live in device memory on the same GPU and are read-only after load, so
+    // both instances can read them. Only offered when the consumer actually
+    // runs on CUDA (a CPU/Vulkan consumer cannot read another instance's
+    // buffers safely) and the model is EdgeTAM (the seam's fixed contract).
+    if (!model.backend || !ggml_backend_is_cuda(model.backend)) return nullptr;
+    if (!model.hparams.is_edgetam()) return nullptr;
+    ggml_backend_t b = ggml_backend_cuda_init(0);
+    if (!b) return nullptr;
+    auto* ea = new sam3_encoder_ahead();
+    ea->backend = b;
+    ea->galloc  = ggml_gallocr_new(ggml_backend_get_default_buffer_type(b));
+    if (!ea->galloc) { ggml_backend_free(b); delete ea; return nullptr; }
+    fprintf(stderr, "%s: ggml encoder-ahead producer on %s\n", __func__, ggml_backend_name(b));
+    return ea;
+#else
+    (void)model;  // producer pool unavailable on non-CUDA ggml builds
+    return nullptr;
+#endif
+}
+
+// Preprocess + run the EdgeTAM RepViT+FPN encoder graph on the PRODUCER backend
+// and extract the 3 neck levels as contiguous [D,W,H] floats (the prefetch-seam
+// layout). n0/n1/n2 must hold 256*256*256, 256*128*128, 256*64*64 floats.
+bool sam3_encoder_ahead_encode(sam3_encoder_ahead* ea, const sam3_model& model,
+                               const sam3_image& image,
+                               float* n0, float* n1, float* n2) {
+    if (!ea || !ea->backend || !n0 || !n1 || !n2) return false;
+    const int img_size = 1024;  // the prefetch seam's fixed EdgeTAM contract
+
+    std::vector<float> img_data = sam2_preprocess_image(image, img_size);
+
+    // Build the same encoder graph edgetam_encode_image builds (build cost is
+    // ~0.3 ms per U0; the gallocr reuses its reservation across frames).
+    const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+    struct ggml_init_params gparams = {buf_size, nullptr, true};
+    struct ggml_context* ctx0 = ggml_init(gparams);
+    if (!ctx0) return false;
+
+    struct ggml_tensor* inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img_size, img_size, 3, 1);
+    ggml_set_name(inp, "input_image");
+    ggml_set_input(inp);
+
+    struct ggml_tensor* stage_outs[4] = {};
+    edgetam_build_repvit_graph(ctx0, inp, model, stage_outs);
+    struct ggml_tensor* fpn_outs[4] = {};
+    edgetam_build_fpn_neck_graph(ctx0, stage_outs, model, fpn_outs);
+    for (int i = 0; i < 3; ++i) ggml_set_output(fpn_outs[i]);
+
+    struct ggml_cgraph* graph = ggml_new_graph_custom(ctx0, 32768, false);
+    for (int i = 0; i < 3; ++i) ggml_build_forward_expand(graph, fpn_outs[i]);
+
+    bool ok = ggml_gallocr_alloc_graph(ea->galloc, graph);
+    if (ok) {
+        ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+        // n_threads only applies to a CPU backend; the producer is CUDA here.
+        ok = sam3_graph_compute(ea->backend, graph, 4);
+    }
+    if (ok) {
+        float* dst[3] = {n0, n1, n2};
+        for (int i = 0; i < 3; ++i)
+            ggml_backend_tensor_get(fpn_outs[i], dst[i], 0, ggml_nbytes(fpn_outs[i]));
+    }
+    ggml_free(ctx0);
+    return ok;
+}
+
+// Device-seam producer (increment 7): encode on the producer instance with a
+// CACHED graph, then same-instance async D2D into this slot's persistent neck
+// tensors + one producer-stream sync so the writes are complete before the Go
+// channel signals the consumer (happens-before across threads).
+bool sam3_encoder_ahead_encode_dev(sam3_encoder_ahead* ea, const sam3_model& model,
+                                   const sam3_image& image, int slot) {
+#ifdef GGML_USE_CUDA
+    if (!ea || !ea->backend || slot < 0 || slot >= sam3_encoder_ahead::SLOTS) return false;
+    if (model.transport.kind != SAM3_TRANSPORT_DEVICE) return false;
+    const int img_size = 1024;  // the prefetch seam's fixed EdgeTAM contract
+
+    std::vector<float> img_data = sam2_preprocess_image(image, img_size);
+
+    if (!ea->graph) {
+        const size_t buf_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        ea->gctx = ggml_init(gparams);
+        if (!ea->gctx) return false;
+        ea->inp = ggml_new_tensor_4d(ea->gctx, GGML_TYPE_F32, img_size, img_size, 3, 1);
+        ggml_set_name(ea->inp, "input_image");
+        ggml_set_input(ea->inp);
+        struct ggml_tensor* stage_outs[4] = {};
+        edgetam_build_repvit_graph(ea->gctx, ea->inp, model, stage_outs);
+        struct ggml_tensor* fpn_outs[4] = {};
+        edgetam_build_fpn_neck_graph(ea->gctx, stage_outs, model, fpn_outs);
+        for (int i = 0; i < 3; ++i) { ggml_set_output(fpn_outs[i]); ea->fpn[i] = fpn_outs[i]; }
+        ea->graph = ggml_new_graph_custom(ea->gctx, 32768, false);
+        for (int i = 0; i < 3; ++i) ggml_build_forward_expand(ea->graph, ea->fpn[i]);
+        if (!ggml_gallocr_alloc_graph(ea->galloc, ea->graph)) {
+            ggml_free(ea->gctx); ea->gctx = nullptr; ea->graph = nullptr;
+            return false;
+        }
+        // Per-slot persistent neck tensors: one ctx + one buffer for all slots.
+        struct ggml_init_params sp = {ggml_tensor_overhead() * 16, nullptr, true};
+        ea->slot_ctx = ggml_init(sp);
+        for (int s = 0; s < sam3_encoder_ahead::SLOTS; ++s)
+            for (int i = 0; i < 3; ++i)
+                ea->slot_n[s][i] = ggml_dup_tensor(ea->slot_ctx, ea->fpn[i]);
+        ea->slot_buf = ggml_backend_alloc_ctx_tensors(ea->slot_ctx, ea->backend);
+        if (!ea->slot_buf) {
+            if (ea->slot_ctx) { ggml_free(ea->slot_ctx); ea->slot_ctx = nullptr; }
+            ggml_free(ea->gctx); ea->gctx = nullptr; ea->graph = nullptr;
+            return false;
+        }
+        fprintf(stderr, "%s: device-resident encoder-ahead seam active (%d slots)\n",
+                __func__, sam3_encoder_ahead::SLOTS);
+    }
+
+    ggml_backend_tensor_set(ea->inp, img_data.data(), 0, img_data.size() * sizeof(float));
+    if (!sam3_graph_compute(ea->backend, ea->graph, 4)) return false;
+    for (int i = 0; i < 3; ++i)
+        ggml_backend_tensor_copy_async(ea->backend, ea->backend, ea->fpn[i], ea->slot_n[slot][i]);
+    ggml_backend_synchronize(ea->backend);
+    ea->slot_filled[slot] = true;
+    return true;
+#else
+    (void)ea; (void)model; (void)image; (void)slot;
+    return false;
+#endif
+}
+
+// Consumer side of the device seam: stash this slot's device tensors for
+// edgetam_encode_image's device-prefetch branch (consumer thread only, SPSC).
+bool sam3_set_prefetched_neck_dev(sam3_encoder_ahead* ea, int slot) {
+    if (!ea || slot < 0 || slot >= sam3_encoder_ahead::SLOTS || !ea->slot_filled[slot])
+        return false;
+    ea->slot_filled[slot] = false;
+    for (int i = 0; i < 3; ++i) s_prefetch_dev.n[i] = ea->slot_n[slot][i];
+    s_prefetch_dev.ready = true;
+    return true;
+}
+
+void sam3_encoder_ahead_destroy(sam3_encoder_ahead* ea) {
+    if (!ea) return;
+    s_prefetch_dev.ready = false;
+    if (ea->slot_buf) ggml_backend_buffer_free(ea->slot_buf);
+    if (ea->slot_ctx) ggml_free(ea->slot_ctx);
+    if (ea->gctx)     ggml_free(ea->gctx);
+    if (ea->galloc)  ggml_gallocr_free(ea->galloc);
+    if (ea->backend) ggml_backend_free(ea->backend);
+    delete ea;
 }
 
 /*****************************************************************************
@@ -5833,7 +6619,7 @@ static struct ggml_tensor* edgetam_perceiver_layer_forward(
         k = ggml_reshape_4d(ctx, k, D, N_x,   1, batch);
         v = ggml_reshape_4d(ctx, v, D, N_x,   1, batch);
 
-        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        auto* attn = sam3_fa_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
         // Output: [D, 1, N_lat, batch] (permuted) → reshape to [D, N_lat, batch]
         attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
 
@@ -5871,7 +6657,7 @@ static struct ggml_tensor* edgetam_perceiver_layer_forward(
         k = ggml_reshape_4d(ctx, k, D, N_lat, 1, batch);
         v = ggml_reshape_4d(ctx, v, D, N_lat, 1, batch);
 
-        auto* attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        auto* attn = sam3_fa_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
         attn = ggml_reshape_3d(ctx, attn, D, N_lat, batch);
 
         auto* sa_out = ggml_mul_mat(ctx, layer.sa_out_w, attn);
@@ -5961,7 +6747,14 @@ static bool edgetam_perceiver_forward(
         const std::vector<float>& mem_pos,        // [64 * H * W]
         int H, int W,
         std::vector<float>& out_latents,          // output: [512 * 64]
-        std::vector<float>& out_pos) {            // output: [512 * 64]
+        std::vector<float>& out_pos,              // output: [512 * 64]
+        // Increment 4 (device transport): when set, feed the memory features
+        // by same-backend D2D from this live memenc output tensor instead of
+        // uploading `mem_features` (which may then be empty), and route the 2D
+        // window partition IN-GRAPH (a pure byte gather — bit-identical to
+        // edgetam_window_partition_cpu). trk supplies the input twins.
+        struct ggml_tensor* mem_features_dev = nullptr,
+        sam3_tracker* trk = nullptr) {
     auto t_start = std::chrono::high_resolution_clock::now();
 
     const auto& perc = model.perceiver;
@@ -5990,11 +6783,20 @@ static bool edgetam_perceiver_forward(
 
     // ── Read learnable latent tokens from model weights ─────────────────
     // latents_1d: ggml shape [64, 256] → ne[0]=64(D), ne[1]=256(N)
+    // (device-transport weight cache when populated — increment 2)
     std::vector<float> latents_1d_data(D * N_1d);
-    sam3_read_f32(perc.latents_1d, latents_1d_data.data(), D * N_1d);
+    if (!model.wcache.perc_latents_1d.empty())
+        std::copy(model.wcache.perc_latents_1d.begin(), model.wcache.perc_latents_1d.end(),
+                  latents_1d_data.begin());
+    else
+        sam3_read_f32(perc.latents_1d, latents_1d_data.data(), D * N_1d);
 
     std::vector<float> latents_2d_data(D * N_2d);
-    sam3_read_f32(perc.latents_2d, latents_2d_data.data(), D * N_2d);
+    if (!model.wcache.perc_latents_2d.empty())
+        std::copy(model.wcache.perc_latents_2d.begin(), model.wcache.perc_latents_2d.end(),
+                  latents_2d_data.begin());
+    else
+        sam3_read_f32(perc.latents_2d, latents_2d_data.data(), D * N_2d);
 
     // ── Prepare 2D windowed features on CPU ─────────────────────────────
     // mem_features layout: [D, H*W] (ggml: ne[0]=D, ne[1]=H*W, stored as
@@ -6005,8 +6807,12 @@ static bool edgetam_perceiver_forward(
     // pos = w + h * W.
 
     // Window partition: [D, H*W] → [D, ws2, N_2d] i.e. [64, 16, 256]
-    std::vector<float> feat_windowed(D * ws2 * N_2d);
-    edgetam_window_partition_cpu(mem_features.data(), D, H, W, ws, feat_windowed.data());
+    // (host path only — the device path partitions in-graph from the leaf)
+    std::vector<float> feat_windowed;
+    if (!mem_features_dev) {
+        feat_windowed.resize((size_t)D * ws2 * N_2d);
+        edgetam_window_partition_cpu(mem_features.data(), D, H, W, ws, feat_windowed.data());
+    }
 
     // Reshape latents_2d for windowed processing: [D, N_2d] → [D, 1, N_2d]
     // Each window has exactly 1 latent token.
@@ -6020,29 +6826,60 @@ static bool edgetam_perceiver_forward(
     // ══════════════════════════════════════════════════════════════════════
     std::vector<float> result_1d(D * N_1d);
     {
+        // Increment 6b: cached 1D sub-graph (fixed shapes; device driver only)
+        const bool use_pgc = trk && model.transport.kind == SAM3_TRANSPORT_DEVICE;
+        uint64_t pkey = 1469598103934665603ull;
+        sam3_key_mix(pkey, (uint64_t)D); sam3_key_mix(pkey, (uint64_t)HW);
+        sam3_key_mix(pkey, (uint64_t)N_1d);
+        sam3_key_mix(pkey, mem_features_dev ? 2ull : 1ull);
+        sam3_stage_gcache* pgc = use_pgc ? &trk->gc_perc1 : nullptr;
+        const bool pgc_hit = pgc && pgc->ctx && pgc->key == pkey;
+        if (pgc && !pgc_hit && pgc->ctx) sam3_stage_gcache_release(*pgc);
+
+        struct ggml_context* ctx0 = nullptr;
+        struct ggml_tensor* lat_in = nullptr, * x4 = nullptr, * x_in = nullptr;
+        struct ggml_tensor* pos_in = nullptr, * latents = nullptr;
+        struct ggml_cgraph* graph = nullptr;
+        struct ggml_gallocr* galloc = nullptr;
+        if (pgc_hit) {
+            ctx0 = pgc->ctx; graph = pgc->graph; galloc = pgc->galloc;
+            lat_in = pgc->in[0]; x4 = pgc->in[1]; pos_in = pgc->in[2];
+            latents = pgc->out[0];
+        } else {
         const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
         struct ggml_init_params gparams = {buf_size, nullptr, true};
-        auto* ctx0 = ggml_init(gparams);
+        ctx0 = ggml_init(gparams);
         if (!ctx0) {
             fprintf(stderr, "%s: failed to init 1D context\n", __func__);
             return false;
         }
 
         // Input tensors (fresh, no dependency chains)
-        auto* lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N_1d, 1);
+        lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N_1d, 1);
         ggml_set_name(lat_in, "lat_1d_in");
         ggml_set_input(lat_in);
 
-        auto* x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
-        ggml_set_name(x_in, "feat_1d_in");
-        ggml_set_input(x_in);
+        // Device transport: the fresh leaf mirrors the memenc output's 4D
+        // layout so it can be fed by whole-tensor D2D; the graph still sees
+        // [D, HW, 1] via an in-graph reshape of the leaf (curr-fix pattern).
+        if (mem_features_dev) {
+            x4 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, mem_features_dev->ne[0],
+                                    mem_features_dev->ne[1], mem_features_dev->ne[2], 1);
+            ggml_set_name(x4, "feat_1d_in"); ggml_set_input(x4);
+            x_in = ggml_reshape_3d(ctx0, x4, D, HW, 1);
+        } else {
+            x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
+            ggml_set_name(x_in, "feat_1d_in");
+            ggml_set_input(x_in);
+            x4 = x_in;
+        }
 
-        auto* pos_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
+        pos_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, HW, 1);
         ggml_set_name(pos_in, "pos_1d_in");
         ggml_set_input(pos_in);
 
         // Run perceiver layers
-        auto* latents = lat_in;
+        latents = lat_in;
         for (int l = 0; l < n_layers; ++l) {
             latents = edgetam_perceiver_layer_forward(ctx0, latents, x_in, pos_in,
                                                       perc.layers[l]);
@@ -6054,10 +6891,10 @@ static bool edgetam_perceiver_forward(
         ggml_set_output(latents);
 
         // Build + allocate + compute
-        auto* graph = ggml_new_graph_custom(ctx0, 16384, false);
+        graph = ggml_new_graph_custom(ctx0, 16384, false);
         ggml_build_forward_expand(graph, latents);
 
-        auto* galloc = ggml_gallocr_new(
+        galloc = ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(galloc, graph) ||
             !ggml_gallocr_alloc_graph(galloc, graph)) {
@@ -6067,26 +6904,51 @@ static bool edgetam_perceiver_forward(
             return false;
         }
 
-        // Set inputs
-        ggml_backend_tensor_set(lat_in, latents_1d_data.data(), 0,
-                                D * N_1d * sizeof(float));
-        ggml_backend_tensor_set(x_in, mem_features.data(), 0,
-                                D * HW * sizeof(float));
-        ggml_backend_tensor_set(pos_in, mem_pos.data(), 0,
-                                D * HW * sizeof(float));
+        if (use_pgc) {
+            pgc->ctx = ctx0; pgc->graph = graph; pgc->galloc = galloc; pgc->key = pkey;
+            pgc->in[0] = lat_in; pgc->in[1] = x4; pgc->in[2] = pos_in;
+            pgc->out[0] = latents;
+        }
+        }  // end build path
+
+        // Set inputs (device transport: latents/pos via persistent twins,
+        // features by D2D from the live memenc output — increment 4)
+        if (trk)
+            sam3_stagebuf_push(model.transport, trk->tw_perc_lat1, latents_1d_data.data(),
+                               D * N_1d * sizeof(float), lat_in, 1, "perc_lat1");
+        else
+            ggml_backend_tensor_set(lat_in, latents_1d_data.data(), 0,
+                                    D * N_1d * sizeof(float));
+        if (mem_features_dev)
+            sam3_stage_feed(model.transport, mem_features_dev, x4, "perc_feat_1d");
+        else
+            ggml_backend_tensor_set(x_in, mem_features.data(), 0,
+                                    D * HW * sizeof(float));
+        if (trk)
+            sam3_stagebuf_push(model.transport, trk->tw_perc_pos, mem_pos.data(),
+                               D * HW * sizeof(float), pos_in, trk->pe_gen, "perc_pos");
+        else
+            ggml_backend_tensor_set(pos_in, mem_pos.data(), 0,
+                                    D * HW * sizeof(float));
 
         if (!sam3_graph_compute(model.backend, graph, 4)) {
             fprintf(stderr, "%s: 1D graph compute failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
+            if (pgc && (pgc_hit || pgc->ctx)) {
+                sam3_stage_gcache_release(*pgc);
+            } else {
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx0);
+            }
             return false;
         }
 
         ggml_backend_tensor_get(latents, result_1d.data(), 0,
                                 D * N_1d * sizeof(float));
 
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
+        if (!use_pgc) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -6094,21 +6956,61 @@ static bool edgetam_perceiver_forward(
     // ══════════════════════════════════════════════════════════════════════
     std::vector<float> result_2d(D * N_2d);
     {
+        // Increment 6b: cached 2D sub-graph (fixed shapes; device driver only)
+        const bool use_pgc = trk && model.transport.kind == SAM3_TRANSPORT_DEVICE;
+        uint64_t pkey = 1469598103934665603ull;
+        sam3_key_mix(pkey, (uint64_t)D); sam3_key_mix(pkey, (uint64_t)ws2);
+        sam3_key_mix(pkey, (uint64_t)N_2d);
+        sam3_key_mix(pkey, mem_features_dev ? 2ull : 1ull);
+        sam3_stage_gcache* pgc = use_pgc ? &trk->gc_perc2 : nullptr;
+        const bool pgc_hit = pgc && pgc->ctx && pgc->key == pkey;
+        if (pgc && !pgc_hit && pgc->ctx) sam3_stage_gcache_release(*pgc);
+
+        struct ggml_context* ctx0 = nullptr;
+        struct ggml_tensor* x4 = nullptr, * x_in = nullptr, * lat_in = nullptr;
+        struct ggml_tensor* lat_out = nullptr;
+        struct ggml_cgraph* graph = nullptr;
+        struct ggml_gallocr* galloc = nullptr;
+        if (pgc_hit) {
+            ctx0 = pgc->ctx; graph = pgc->graph; galloc = pgc->galloc;
+            x4 = pgc->in[0]; lat_in = pgc->in[1]; lat_out = pgc->out[0];
+        } else {
         const size_t buf_size = ggml_tensor_overhead() * 4096 + ggml_graph_overhead();
         struct ggml_init_params gparams = {buf_size, nullptr, true};
-        auto* ctx0 = ggml_init(gparams);
+        ctx0 = ggml_init(gparams);
         if (!ctx0) {
             fprintf(stderr, "%s: failed to init 2D context\n", __func__);
             return false;
         }
 
-        // Input: windowed features [D, ws2, N_2d] where batch dim = N_2d = 256
-        auto* x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, ws2, N_2d);
-        ggml_set_name(x_in, "feat_2d_in");
-        ggml_set_input(x_in);
+        // Input: windowed features [D, ws2, N_2d] where batch dim = N_2d = 256.
+        // Device transport (increment 4): the leaf mirrors the memenc output's
+        // 4D layout and the window partition happens IN-GRAPH — a pure byte
+        // gather (reshape/permute/cont), bit-identical to the CPU partition:
+        //   [D, W, H]                      x = wx*ws+ix, y = wy*ws+iy
+        //   → [D, ws, nw, H]               split x into (ix, wx)
+        //   → perm(0,1,3,2) → [D, ws, H, nw]      (d, ix, y, wx)
+        //   → [D*ws, ws, nw, nw]           split y into (iy, wy)
+        //   → perm(0,1,3,2) → [D*ws, ws, nw, nw]  (d·ix, iy, wx, wy)
+        //   → [D, ws2, N_2d]               token = iy*ws+ix, window = wy*nw+wx
+        if (mem_features_dev) {
+            x4 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, mem_features_dev->ne[0],
+                                    mem_features_dev->ne[1], mem_features_dev->ne[2], 1);
+            ggml_set_name(x4, "feat_2d_in"); ggml_set_input(x4);
+            auto* a = ggml_reshape_4d(ctx0, x4, D, ws, nw, H);
+            auto* b = ggml_cont(ctx0, ggml_permute(ctx0, a, 0, 1, 3, 2));
+            auto* c = ggml_reshape_4d(ctx0, b, D * ws, ws, nw, nw);
+            auto* dperm = ggml_cont(ctx0, ggml_permute(ctx0, c, 0, 1, 3, 2));
+            x_in = ggml_reshape_3d(ctx0, dperm, D, ws2, N_2d);
+        } else {
+            x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, ws2, N_2d);
+            ggml_set_name(x_in, "feat_2d_in");
+            ggml_set_input(x_in);
+            x4 = x_in;
+        }
 
         // Input: latents [D, 1, N_2d] — 1 latent per window
-        auto* lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, N_2d);
+        lat_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, N_2d);
         ggml_set_name(lat_in, "lat_2d_in");
         ggml_set_input(lat_in);
 
@@ -6120,17 +7022,17 @@ static bool edgetam_perceiver_forward(
         }
 
         // The 2D latents: [D, 1, N_2d] → squeeze to [D, N_2d] for output
-        auto* lat_out = ggml_reshape_2d(ctx0, latents, D, N_2d);
+        lat_out = ggml_reshape_2d(ctx0, latents, D, N_2d);
 
         // Final LayerNorm (shared norm_w/norm_b)
         lat_out = sam3_layer_norm(ctx0, lat_out, perc.norm_w, perc.norm_b);
         ggml_set_name(lat_out, "lat_2d_out");
         ggml_set_output(lat_out);
 
-        auto* graph = ggml_new_graph_custom(ctx0, 16384, false);
+        graph = ggml_new_graph_custom(ctx0, 16384, false);
         ggml_build_forward_expand(graph, lat_out);
 
-        auto* galloc = ggml_gallocr_new(
+        galloc = ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(galloc, graph) ||
             !ggml_gallocr_alloc_graph(galloc, graph)) {
@@ -6140,26 +7042,47 @@ static bool edgetam_perceiver_forward(
             return false;
         }
 
-        // Set windowed features
-        ggml_backend_tensor_set(x_in, feat_windowed.data(), 0,
-                                D * ws2 * N_2d * sizeof(float));
+        if (use_pgc) {
+            pgc->ctx = ctx0; pgc->graph = graph; pgc->galloc = galloc; pgc->key = pkey;
+            pgc->in[0] = x4; pgc->in[1] = lat_in;
+            pgc->out[0] = lat_out;
+        }
+        }  // end build path
+
+        // Set windowed features (device: D2D from the live memenc output; the
+        // partition itself runs in-graph)
+        if (mem_features_dev)
+            sam3_stage_feed(model.transport, mem_features_dev, x4, "perc_feat_2d");
+        else
+            ggml_backend_tensor_set(x_in, feat_windowed.data(), 0,
+                                    D * ws2 * N_2d * sizeof(float));
 
         // Set latents: [D, 256] → interpret as [D, 1, 256]
-        ggml_backend_tensor_set(lat_in, latents_2d_data.data(), 0,
-                                D * N_2d * sizeof(float));
+        if (trk)
+            sam3_stagebuf_push(model.transport, trk->tw_perc_lat2, latents_2d_data.data(),
+                               D * N_2d * sizeof(float), lat_in, 1, "perc_lat2");
+        else
+            ggml_backend_tensor_set(lat_in, latents_2d_data.data(), 0,
+                                    D * N_2d * sizeof(float));
 
         if (!sam3_graph_compute(model.backend, graph, 4)) {
             fprintf(stderr, "%s: 2D graph compute failed\n", __func__);
-            ggml_gallocr_free(galloc);
-            ggml_free(ctx0);
+            if (pgc && (pgc_hit || pgc->ctx)) {
+                sam3_stage_gcache_release(*pgc);
+            } else {
+                ggml_gallocr_free(galloc);
+                ggml_free(ctx0);
+            }
             return false;
         }
 
         ggml_backend_tensor_get(lat_out, result_2d.data(), 0,
                                 D * N_2d * sizeof(float));
 
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
+        if (!use_pgc) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -7173,7 +8096,7 @@ static struct ggml_tensor * sam3_build_vit_attn_core_from_qkv(struct ggml_contex
     K = ggml_reshape_4d(ctx, K, HD, W_cur * H_cur, NH, B_cur);
 
     const float scale = 1.0f / sqrtf((float) HD);
-    struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    struct ggml_tensor * attn_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
 
     return ggml_cont(ctx, ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur));
 }
@@ -7890,7 +8813,7 @@ static struct ggml_tensor* sam3_multihead_attn_fused(
     V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [HD, N_kv, NH, B] non-contiguous; flash_attn uses strides
 
     float scale = 1.0f / sqrtf((float)HD);
-    auto* attn_out = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
+    auto* attn_out = sam3_fa_ext(ctx, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
 
     auto* merged = ggml_reshape_3d(ctx, attn_out, D, N_q, B);
     merged = ggml_mul_mat(ctx, out_proj_w, merged);
@@ -8073,7 +8996,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, S, 1);
 
             sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -8115,7 +9038,7 @@ static sam3_geom_result sam3_build_geom_enc_graph(
             V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)HD);
-            auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, S_q, 1);
 
             ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8423,7 +9346,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
 
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
@@ -8465,7 +9388,7 @@ static struct ggml_tensor* sam3_fenc_layer_forward(
 
         auto* ca_mask = sam3_expand_token_attn_bias(ctx, prompt_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, ca_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_fa_ext(ctx, Q, K, V, ca_mask, scale, 0.0f, 0.0f);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
 
         ca_out = ggml_mul_mat(ctx, ly.ca_out_w, ca_out);
@@ -8841,7 +9764,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         float scale = 1.0f / sqrtf((float)HD);
-        auto* sa_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        auto* sa_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         sa_out = ggml_reshape_3d(ctx, sa_out, D, N, B);
         sa_out = ggml_mul_mat(ctx, ly.sa_out_proj_w, sa_out);
         sa_out = ggml_add(ctx, sa_out, ly.sa_out_proj_b);
@@ -8884,7 +9807,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
 
         auto* text_mask = sam3_expand_token_attn_bias(ctx, text_attn_bias, N_q, n_heads, B);
         float scale = 1.0f / sqrtf((float)HD);
-        auto* ca_out = ggml_flash_attn_ext(ctx, Q, K, V, text_mask, scale, 0.0f, 0.0f);
+        auto* ca_out = sam3_fa_ext(ctx, Q, K, V, text_mask, scale, 0.0f, 0.0f);
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
         ca_out = ggml_mul_mat(ctx, ly.ca_text_out_w, ca_out);
         ca_out = ggml_add(ctx, ca_out, ly.ca_text_out_b);
@@ -8940,7 +9863,7 @@ static struct ggml_tensor* sam3_ddec_layer_forward(
             ca_out = ggml_mul_mat(ctx, v_t, kq);                 // [HD, N_q, NH, B]
             ca_out = ggml_cont(ctx, ggml_permute(ctx, ca_out, 0, 2, 1, 3));
         } else {
-            ca_out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            ca_out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         }
 
         ca_out = ggml_reshape_3d(ctx, ca_out, D, N_q, B);
@@ -9496,8 +10419,11 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
     pd.num_obj_ptr_tokens = 0;
 
     // Read maskmem_tpos_enc from model (one tensor [MD, 1, 1, 7])
+    // (device-transport weight cache when populated — increment 2)
     std::vector<float> tpos_all(MD * hp.num_maskmem);
-    if (model.mem_enc.tpos[0]) {
+    if (!model.wcache.tpos.empty()) {
+        std::copy(model.wcache.tpos.begin(), model.wcache.tpos.end(), tpos_all.begin());
+    } else if (model.mem_enc.tpos[0]) {
         sam3_read_f32(model.mem_enc.tpos[0], tpos_all.data(), MD * hp.num_maskmem);
     }
 
@@ -9524,8 +10450,12 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
     const int split = D / MD;  // 4
 
     // Read obj_ptr_tpos_proj weights for CPU-side matmul
+    // (device-transport weight cache when populated — increment 3)
     std::vector<float> tpos_w(D * MD), tpos_b(MD);
-    if (model.obj_ptr_tpos_w) {
+    if (!model.wcache.tpos_proj_w.empty()) {
+        std::copy(model.wcache.tpos_proj_w.begin(), model.wcache.tpos_proj_w.end(), tpos_w.begin());
+        std::copy(model.wcache.tpos_proj_b.begin(), model.wcache.tpos_proj_b.end(), tpos_b.begin());
+    } else if (model.obj_ptr_tpos_w) {
         sam3_read_f32(model.obj_ptr_tpos_w, tpos_w.data(), D * MD);
         sam3_read_f32(model.obj_ptr_tpos_b, tpos_b.data(), MD);
     }
@@ -9620,7 +10550,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* sa_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* sa_out = sam3_fa_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
             sa_out = ggml_reshape_3d(ctx, sa_out, D, N, 1);
             sa_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_out_w, sa_out), ly.sa_out_b);
             x = ggml_add(ctx, x, sa_out);
@@ -9665,7 +10595,7 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)D);
-            auto* ca_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            auto* ca_out = sam3_fa_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
             ca_out = ggml_reshape_3d(ctx, ca_out, D, N, 1);
             ca_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_out_w, ca_out), ly.ca_out_b);
             x = ggml_add(ctx, x, ca_out);
@@ -9713,19 +10643,25 @@ static void sam3_extract_obj_ptr_cpu(
         // λ = (obj_score > 0) ? 1.0 : 0.0  (hard threshold, not sigmoid)
         float lambda = (obj_score > 0.0f) ? 1.0f : 0.0f;
 
-        // Project token through MLP
+        // Project token through MLP (weights from the device-transport cache
+        // when populated — increment 2; host driver reads verbatim as today)
         std::vector<float> h(D), tmp(D);
         std::copy(sam_token_data, sam_token_data + D, h.data());
         for (int j = 0; j < 3; ++j) {
             auto* w = model.obj_ptr_proj_w[j];
             auto* b = model.obj_ptr_proj_b[j];
             int nel_w = (int)(w->ne[0] * w->ne[1]);
-            std::vector<float> w_data(nel_w), b_data(D);
-            sam3_read_f32(w, w_data.data(), nel_w);
-            sam3_read_f32(b, b_data.data(), D);
+            const bool cached = !model.wcache.objptr_w[j].empty();
+            std::vector<float> w_data, b_data;
+            if (!cached) {
+                w_data.resize(nel_w); sam3_read_f32(w, w_data.data(), nel_w);
+                b_data.resize(D);     sam3_read_f32(b, b_data.data(), D);
+            }
+            const float* W = cached ? model.wcache.objptr_w[j].data() : w_data.data();
+            const float* B = cached ? model.wcache.objptr_b[j].data() : b_data.data();
             for (int o = 0; o < D; ++o) {
-                float sum = b_data[o];
-                for (int i = 0; i < D; ++i) sum += w_data[o * D + i] * h[i];
+                float sum = B[o];
+                for (int i = 0; i < D; ++i) sum += W[o * D + i] * h[i];
                 tmp[o] = (j < 2) ? std::max(0.0f, sum) : sum;
             }
             std::swap(h, tmp);
@@ -9733,7 +10669,10 @@ static void sam3_extract_obj_ptr_cpu(
 
         // Blend: obj_ptr = λ * projected + (1-λ) * no_obj_ptr
         std::vector<float> no_ptr(D);
-        ggml_backend_tensor_get(model.no_obj_ptr, no_ptr.data(), 0, D * sizeof(float));
+        if (!model.wcache.no_obj_ptr.empty())
+            std::copy(model.wcache.no_obj_ptr.begin(), model.wcache.no_obj_ptr.end(), no_ptr.begin());
+        else
+            ggml_backend_tensor_get(model.no_obj_ptr, no_ptr.data(), 0, D * sizeof(float));
         for (int i = 0; i < D; ++i)
             out_ptr[i] = lambda * h[i] + (1.0f - lambda) * no_ptr[i];
         return;
@@ -9741,7 +10680,10 @@ static void sam3_extract_obj_ptr_cpu(
 
     // SAM3 / default path: binary threshold
     if (obj_score <= 0.0f) {
-        ggml_backend_tensor_get(model.no_obj_ptr, out_ptr, 0, D * sizeof(float));
+        if (!model.wcache.no_obj_ptr.empty())
+            std::copy(model.wcache.no_obj_ptr.begin(), model.wcache.no_obj_ptr.end(), out_ptr);
+        else
+            ggml_backend_tensor_get(model.no_obj_ptr, out_ptr, 0, D * sizeof(float));
         return;
     }
 
@@ -9753,16 +10695,19 @@ static void sam3_extract_obj_ptr_cpu(
         auto* b = model.obj_ptr_proj_b[j];
 
         int nel_w = (int)(w->ne[0] * w->ne[1]);
-        std::vector<float> w_data(nel_w);
-        sam3_read_f32(w, w_data.data(), nel_w);
-
-        std::vector<float> b_data(D);
-        sam3_read_f32(b, b_data.data(), D);
+        const bool cached = !model.wcache.objptr_w[j].empty();
+        std::vector<float> w_data, b_data;
+        if (!cached) {
+            w_data.resize(nel_w); sam3_read_f32(w, w_data.data(), nel_w);
+            b_data.resize(D);     sam3_read_f32(b, b_data.data(), D);
+        }
+        const float* W = cached ? model.wcache.objptr_w[j].data() : w_data.data();
+        const float* B = cached ? model.wcache.objptr_b[j].data() : b_data.data();
 
         for (int o = 0; o < D; ++o) {
-            float sum = b_data[o];
+            float sum = B[o];
             for (int i = 0; i < D; ++i) {
-                sum += w_data[o * D + i] * h[i];
+                sum += W[o * D + i] * h[i];
             }
             tmp[o] = (j < 2) ? std::max(0.0f, sum) : sum;
         }
@@ -10639,7 +11584,7 @@ static struct ggml_tensor* sam3_sam_attention(
 
     // Attention
     float scale = 1.0f / sqrtf((float)HD);
-    auto* out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    auto* out = sam3_fa_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
     // out: [HD, NH, N_q, B] (flash_attn_ext swaps dims 1,2 vs input)
 
 #if 0  // Manual SDPA (for debugging only)
@@ -10786,6 +11731,7 @@ static void sam3_populate_pe_cache(sam3_state& state, const sam3_model& model) {
     }
 
     state.pe_cache_valid = true;
+    state.pe_cache_gen++;  // invalidate stage-transport twins keyed on this cache
     fprintf(stderr, "%s: PE cache populated (%d embeddings, %.1f KB dense grids)\n",
             __func__, pe_nel, 2.0f * D * H * H * sizeof(float) / 1024.0f);
 }
@@ -11599,6 +12545,7 @@ static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hpar
     }
 
     tracker.pe_caches_valid = true;
+    tracker.pe_gen++;  // invalidate stage-transport twins keyed on these caches
     SAM3_LOG(2, "%s: tracker PE caches populated (%.1f KB)\n", __func__,
              (tracker.cached_sinpe_256.size() + tracker.cached_sinpe_64.size() +
               tracker.cached_axial_cis_reord.size()) * sizeof(float) / 1024.0f);
@@ -11629,39 +12576,71 @@ static sam3_prop_output sam3_propagate_single(
     const int N_per_slot = use_perceiver ? (hp.perceiver_n_latents_1d + hp.perceiver_n_latents_2d) : N;
 
     int n_sel = (int)sel.size();
+    int P = std::min((int)ptr_bank.size(), hp.max_obj_ptrs);
+
+    // Increment 3: device prompt assembly. At full steady-state capacity on
+    // the CUDA device driver (EdgeTAM only) the prompt's spatial region is
+    // assembled ON DEVICE — in-graph concat of D2D-fed slot leaves plus the
+    // bit-exact tpos broadcast add — so the per-frame slot downloads and the
+    // ~917 KB prompt/prompt_pos uploads disappear. Ramp frames (bank not yet
+    // full) take the verbatim host path: no padding — padding would append
+    // real attention tokens and change softmax denominators (design §3.4-3).
+    bool device_prompt =
+        model.transport.kind == SAM3_TRANSPORT_DEVICE &&
+        use_perceiver && hp.is_edgetam() && !model.wcache.tpos.empty() &&
+        n_sel == hp.num_maskmem && n_sel <= 16 &&
+        P == hp.max_obj_ptrs && (int)ptr_bank.size() == P;
+    if (device_prompt) {
+        for (int s = 0; s < n_sel; ++s)
+            if (!mem_bank[sel[s]].spatial_feats || !mem_bank[sel[s]].spatial_pe) {
+                device_prompt = false;
+                break;
+            }
+        auto hm = tracker.ptr_host.find(masklet.instance_id);
+        if (hm == tracker.ptr_host.end() || (int)hm->second.size() != (int)ptr_bank.size())
+            device_prompt = false;
+    }
+
     std::vector<std::vector<float>> slot_feats(n_sel), slot_pes(n_sel);
     std::vector<int> spatial_tpos(n_sel, 1);  // default t_pos=1 for non-cond
     for (int s = 0; s < n_sel; ++s) {
-        slot_feats[s].resize(MD * N_per_slot);
-        ggml_backend_tensor_get(mem_bank[sel[s]].spatial_feats,
-                                slot_feats[s].data(), 0, MD * N_per_slot * sizeof(float));
-        slot_pes[s].resize(MD * N_per_slot);
-        if (mem_bank[sel[s]].spatial_pe) {
-            ggml_backend_tensor_get(mem_bank[sel[s]].spatial_pe,
-                                    slot_pes[s].data(), 0, MD * N_per_slot * sizeof(float));
-        } else {
-            sam3_ensure_tracker_pe_caches(tracker, hp, H);
-            if (use_perceiver) {
-                // For perceiver: zeros for 1D tokens, sinusoidal for 2D tokens
-                const int N_1d = hp.perceiver_n_latents_1d;
-                const int N_2d = hp.perceiver_n_latents_2d;
-                memset(slot_pes[s].data(), 0, MD * N_1d * sizeof(float));
-                auto pe_2d = sam3_sinusoidal_pe_2d(16, 16, MD);
-                memcpy(slot_pes[s].data() + MD * N_1d, pe_2d.data(), MD * N_2d * sizeof(float));
+        if (!device_prompt) {
+            slot_feats[s].resize(MD * N_per_slot);
+            ggml_backend_tensor_get(mem_bank[sel[s]].spatial_feats,
+                                    slot_feats[s].data(), 0, MD * N_per_slot * sizeof(float));
+            slot_pes[s].resize(MD * N_per_slot);
+            if (mem_bank[sel[s]].spatial_pe) {
+                ggml_backend_tensor_get(mem_bank[sel[s]].spatial_pe,
+                                        slot_pes[s].data(), 0, MD * N_per_slot * sizeof(float));
             } else {
-                slot_pes[s] = tracker.cached_sinpe_64;
+                sam3_ensure_tracker_pe_caches(tracker, hp, H);
+                if (use_perceiver) {
+                    // For perceiver: zeros for 1D tokens, sinusoidal for 2D tokens
+                    const int N_1d = hp.perceiver_n_latents_1d;
+                    const int N_2d = hp.perceiver_n_latents_2d;
+                    memset(slot_pes[s].data(), 0, MD * N_1d * sizeof(float));
+                    auto pe_2d = sam3_sinusoidal_pe_2d(16, 16, MD);
+                    memcpy(slot_pes[s].data() + MD * N_1d, pe_2d.data(), MD * N_2d * sizeof(float));
+                } else {
+                    slot_pes[s] = tracker.cached_sinpe_64;
+                }
             }
         }
         spatial_tpos[s] = mem_bank[sel[s]].is_cond_frame ? 0 : (n_sel - s);
     }
 
-    int P = std::min((int)ptr_bank.size(), hp.max_obj_ptrs);
     std::vector<std::vector<float>> obj_ptrs(P);
     std::vector<int> ptr_tpos(P);
     int cur_frame = tracker.frame_index;
     for (int p = 0; p < P; ++p) {
-        obj_ptrs[p].resize(D);
-        ggml_backend_tensor_get(ptr_bank[p].second, obj_ptrs[p].data(), 0, D * sizeof(float));
+        if (device_prompt) {
+            // host mirror maintained by sam3_store_obj_ptr — same values the
+            // D2H get would return, without the 16 per-frame syncs
+            obj_ptrs[p] = tracker.ptr_host[masklet.instance_id][p];
+        } else {
+            obj_ptrs[p].resize(D);
+            ggml_backend_tensor_get(ptr_bank[p].second, obj_ptrs[p].data(), 0, D * sizeof(float));
+        }
         // Use actual frame distance (matches Python: abs(frame_idx - t))
         ptr_tpos[p] = std::abs(cur_frame - ptr_bank[p].first);
         if (ptr_tpos[p] < 1) ptr_tpos[p] = 1;  // minimum distance of 1
@@ -11690,7 +12669,35 @@ static sam3_prop_output sam3_propagate_single(
         }
     }
 #endif
-    auto pd = sam3_build_prompt_and_pos(model, slot_feats, slot_pes, spatial_tpos, obj_ptrs, ptr_tpos, H);
+    // Device prompt assembly builds ONLY the pointer region on the host — the
+    // exact code path the host driver runs, so its bytes are identical by
+    // construction — and accounts for the device-assembled spatial region in
+    // the M fields (rope_k sizing and the graph read them).
+    sam3_prompt_data pd;
+    if (device_prompt) {
+        const std::vector<std::vector<float>> no_slots;
+        const std::vector<int> no_tpos;
+        pd = sam3_build_prompt_and_pos(model, no_slots, no_slots, no_tpos, obj_ptrs, ptr_tpos, H);
+        pd.M_spatial = n_sel * N_per_slot;
+        pd.M_total   = pd.M_spatial + pd.num_obj_ptr_tokens;
+    } else {
+        pd = sam3_build_prompt_and_pos(model, slot_feats, slot_pes, spatial_tpos, obj_ptrs, ptr_tpos, H);
+    }
+
+    // tpos rows for the selected slots (device path; ~1.8 KB upload). Matches
+    // the host semantics exactly: rows outside [0, num_maskmem) add nothing.
+    std::vector<float> tpos_sel;
+    if (device_prompt) {
+        tpos_sel.assign((size_t)MD * n_sel, 0.0f);
+        for (int s = 0; s < n_sel; ++s) {
+            const int tpos_idx = spatial_tpos[s];
+            if (tpos_idx >= 0 && tpos_idx < hp.num_maskmem) {
+                const int enc_idx = hp.num_maskmem - tpos_idx - 1;
+                memcpy(&tpos_sel[(size_t)s * MD], &model.wcache.tpos[(size_t)enc_idx * MD],
+                       MD * sizeof(float));
+            }
+        }
+    }
 
     // ── RoPE frequencies (cached) ──────────────────────────────────────
     sam3_ensure_tracker_pe_caches(tracker, hp, H);
@@ -11823,18 +12830,71 @@ static sam3_prop_output sam3_propagate_single(
     // stays 0 and the combined compute lands in mem_attn_compute_ms. U1 reuses
     // this graph across frames, which should drive build_ms+alloc_ms → 0.
     SAM3_TIME_BEGIN(_t_prop_build);
-    const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
-    struct ggml_init_params gparams = {buf_size, nullptr, true};
-    auto* ctx0 = ggml_init(gparams);
-    if (!ctx0) return output;
+    // Increment 6 (CLAUDE.md addendum 4): on the CUDA device driver, reuse the
+    // stage graph across frames when every topology-affecting input matches.
+    // Ramp frames (growing M_total) miss the key and rebuild; steady state
+    // hits every frame — no rebuild, no gallocr realloc, stable leaf pointers
+    // (the precondition for ggml-CUDA graph replay).
+    const bool use_gcache = model.transport.kind == SAM3_TRANSPORT_DEVICE && !use_cml_ma;
+    uint64_t gkey = 1469598103934665603ull;
+    sam3_key_mix(gkey, (uint64_t)H);
+    sam3_key_mix(gkey, (uint64_t)pd.M_total);
+    sam3_key_mix(gkey, (uint64_t)pd.num_obj_ptr_tokens);
+    sam3_key_mix(gkey, (uint64_t)pd.M_spatial);
+    sam3_key_mix(gkey, device_prompt ? (uint64_t)n_sel : 0ull);
+    sam3_key_mix(gkey, device_prompt ? 2ull : 1ull);
+    sam3_key_mix(gkey, (uint64_t)N_per_slot);
+    auto& gc = tracker.gc_prop;
+    const bool gcache_hit = use_gcache && gc.ctx && gc.key == gkey;
+    if (use_gcache && !gcache_hit && gc.ctx) sam3_prop_gcache_release(gc);
+
+    struct ggml_context* ctx0 = nullptr;
+    if (gcache_hit) {
+        ctx0 = gc.ctx;
+    } else {
+        const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        ctx0 = ggml_init(gparams);
+        if (!ctx0) return output;
+    }
 
     // Memory-attention inputs (ggml path only). In the CoreML mem-attn path these
     // stay null and cond_spatial is an input tensor filled from the CoreML output.
-    struct ggml_tensor* curr = nullptr, * src_pos_t = nullptr;
+    struct ggml_tensor* curr = nullptr, * curr_in = nullptr, * src_pos_t = nullptr;
     struct ggml_tensor* prompt_t = nullptr, * prompt_pos_t = nullptr;
     struct ggml_tensor* rope_q_t = nullptr, * rope_k_t = nullptr;
     struct ggml_tensor* cond_spatial = nullptr;
+    // Device prompt assembly leaves (increment 3; null on the host path)
+    struct ggml_tensor* slot_feat_leaf[16] = {};
+    struct ggml_tensor* slot_pe_leaf[16] = {};
+    struct ggml_tensor* tpos_leaf = nullptr;
+    struct ggml_tensor* ptr_leaf = nullptr, * ptr_pos_leaf = nullptr;
+    struct ggml_tensor* prompt_node = nullptr, * prompt_pos_node = nullptr;
+    // Hoisted so both the build path and the cache-hit path can set them
+    struct ggml_tensor* sparse_in = nullptr, * image_pe = nullptr, * dense_emb = nullptr;
+    struct ggml_tensor* trk_s0 = nullptr, * trk_s1 = nullptr;
+    struct ggml_tensor* o_masks = nullptr, * o_iou = nullptr, * o_obj = nullptr;
+    struct ggml_tensor* o_sam = nullptr, * o_mtok = nullptr;
+    struct ggml_cgraph* graph = nullptr;
+    struct ggml_gallocr* galloc = nullptr;
+    const int H0 = H * 4, H1 = H * 2;
 
+    if (gcache_hit) {
+        // Reuse the cached stage graph in place; only the inputs change.
+        graph = gc.graph; galloc = gc.galloc;
+        curr_in = gc.curr_in; curr = gc.curr_in; src_pos_t = gc.src_pos;
+        prompt_t = gc.prompt; prompt_pos_t = gc.prompt_pos;
+        rope_q_t = gc.rope_q; rope_k_t = gc.rope_k;
+        sparse_in = gc.sparse; image_pe = gc.image_pe; dense_emb = gc.dense;
+        trk_s0 = gc.trk_s0; trk_s1 = gc.trk_s1;
+        tpos_leaf = gc.tpos; ptr_leaf = gc.ptr; ptr_pos_leaf = gc.ptr_pos;
+        for (int i = 0; i < 16; ++i) {
+            slot_feat_leaf[i] = gc.slot_feat[i];
+            slot_pe_leaf[i]   = gc.slot_pe[i];
+        }
+        o_masks = gc.masks; o_iou = gc.iou; o_obj = gc.obj;
+        o_sam = gc.sam_token; o_mtok = gc.mask_tokens;
+    } else {
     if (use_cml_ma) {
         // CoreML produced the attended features; inject them as a decoder input.
         cond_spatial = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
@@ -11844,18 +12904,65 @@ static sam3_prop_output sam3_propagate_single(
         // CRITICAL: create fresh input tensors for state features.
         // Using state.neck_trk[*] directly as ggml_reshape operands pulls in
         // the entire ViT+neck recomputation from the image encoder graph.
-        curr = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
-        ggml_set_name(curr, "prop_curr"); ggml_set_input(curr);
+        if (model.transport.kind == SAM3_TRANSPORT_DEVICE) {
+            // Device transport: the fresh input LEAF mirrors state.neck_trk[2]'s
+            // 4D layout so sam3_stage_feed can whole-tensor D2D into it; the
+            // mem-attn builder still sees [D, N, 1] via an in-graph reshape of
+            // the fresh leaf (no src[] ancestry — CLAUDE.md rule 2 cannot fire).
+            // Host mode keeps today's 3D tensor and graph bit-for-bit.
+            curr_in = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                                         state.neck_trk[2]->ne[0],
+                                         state.neck_trk[2]->ne[1],
+                                         state.neck_trk[2]->ne[2], 1);
+            ggml_set_name(curr_in, "prop_curr"); ggml_set_input(curr_in);
+            curr = ggml_reshape_3d(ctx0, curr_in, D, N, 1);
+        } else {
+            curr = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
+            ggml_set_name(curr, "prop_curr"); ggml_set_input(curr);
+            curr_in = curr;
+        }
 
         // src_pos (sinusoidal PE 256-dim for 72×72)
         src_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
         ggml_set_name(src_pos_t, "src_pos"); ggml_set_input(src_pos_t);
 
-        // Prompt and prompt_pos
-        prompt_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, pd.M_total, 1);
-        ggml_set_name(prompt_t, "prompt"); ggml_set_input(prompt_t);
-        prompt_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, pd.M_total, 1);
-        ggml_set_name(prompt_pos_t, "prompt_pos"); ggml_set_input(prompt_pos_t);
+        // Prompt and prompt_pos. Device prompt assembly (increment 3): the
+        // spatial region is concatenated IN-GRAPH from fresh slot leaves fed
+        // by D2D (bank slots never round-trip the bus); the pointer region is
+        // a small host upload built by the exact host code path. All operands
+        // are fresh leaves — no state-tensor ancestry (CLAUDE.md rule 2).
+        if (device_prompt) {
+            struct ggml_tensor* pr = nullptr;
+            struct ggml_tensor* pp = nullptr;
+            tpos_leaf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, MD, n_sel);
+            ggml_set_name(tpos_leaf, "prompt_tpos"); ggml_set_input(tpos_leaf);
+            for (int s = 0; s < n_sel; ++s) {
+                slot_feat_leaf[s] = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, MD, N_per_slot);
+                ggml_set_name(slot_feat_leaf[s], "prompt_slot_feat"); ggml_set_input(slot_feat_leaf[s]);
+                slot_pe_leaf[s] = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, MD, N_per_slot);
+                ggml_set_name(slot_pe_leaf[s], "prompt_slot_pe"); ggml_set_input(slot_pe_leaf[s]);
+                // pos_s = slot_pe + tpos[enc_idx] broadcast over the slot's
+                // tokens — a single element-wise fp32 add, bit-identical to
+                // the host's CPU add of the same operands.
+                auto* tp_s = ggml_cont(ctx0, ggml_view_2d(ctx0, tpos_leaf, MD, 1,
+                                                          tpos_leaf->nb[1],
+                                                          (size_t)s * tpos_leaf->nb[1]));
+                auto* pos_s = ggml_add(ctx0, slot_pe_leaf[s], tp_s);
+                pr = pr ? ggml_concat(ctx0, pr, slot_feat_leaf[s], 1) : slot_feat_leaf[s];
+                pp = pp ? ggml_concat(ctx0, pp, pos_s, 1) : pos_s;
+            }
+            ptr_leaf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, MD, pd.num_obj_ptr_tokens);
+            ggml_set_name(ptr_leaf, "prompt_ptr"); ggml_set_input(ptr_leaf);
+            ptr_pos_leaf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, MD, pd.num_obj_ptr_tokens);
+            ggml_set_name(ptr_pos_leaf, "prompt_ptr_pos"); ggml_set_input(ptr_pos_leaf);
+            prompt_node     = ggml_concat(ctx0, pr, ptr_leaf, 1);
+            prompt_pos_node = ggml_concat(ctx0, pp, ptr_pos_leaf, 1);
+        } else {
+            prompt_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, pd.M_total, 1);
+            ggml_set_name(prompt_t, "prompt"); ggml_set_input(prompt_t);
+            prompt_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, pd.M_total, 1);
+            ggml_set_name(prompt_pos_t, "prompt_pos"); ggml_set_input(prompt_pos_t);
+        }
 
         // RoPE frequencies
         rope_q_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2, half_d, N);
@@ -11866,29 +12973,29 @@ static sam3_prop_output sam3_propagate_single(
         }
 
         auto* conditioned = sam3_build_mem_attn_graph(ctx0, model, curr, src_pos_t,
-                                                      prompt_t, prompt_pos_t,
+                                                      device_prompt ? prompt_node : prompt_t,
+                                                      device_prompt ? prompt_pos_node : prompt_pos_t,
                                                       rope_q_t, rope_k_t,
                                                       pd.num_obj_ptr_tokens);
         cond_spatial = ggml_reshape_4d(ctx0, conditioned, D, H, H, 1);
     }
 
     // Bug 3 fix: single not_a_point_embed token instead of empty sparse
-    auto* sparse_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, 1);
+    sparse_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, 1);
     ggml_set_name(sparse_in, "prop_sparse");
     ggml_set_input(sparse_in);
 
-    auto* image_pe = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+    image_pe = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
     ggml_set_name(image_pe, "prop_pe");
     ggml_set_input(image_pe);
-    auto* dense_emb = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+    dense_emb = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
     ggml_set_name(dense_emb, "prop_dense");
     ggml_set_input(dense_emb);
 
-    const int H0 = H * 4, H1 = H * 2;
-    auto* trk_s0 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H0, H0, 1);
+    trk_s0 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H0, H0, 1);
     ggml_set_name(trk_s0, "prop_trk_s0");
     ggml_set_input(trk_s0);
-    auto* trk_s1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H1, H1, 1);
+    trk_s1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H1, H1, 1);
     ggml_set_name(trk_s1, "prop_trk_s1");
     ggml_set_input(trk_s1);
 
@@ -11901,7 +13008,7 @@ static sam3_prop_output sam3_propagate_single(
     ggml_set_output(dec.sam_token);
     if (dec.mask_tokens) ggml_set_output(dec.mask_tokens);
 
-    auto* graph = ggml_new_graph_custom(ctx0, 32768, false);
+    graph = ggml_new_graph_custom(ctx0, 32768, false);
     ggml_build_forward_expand(graph, dec.masks);
     ggml_build_forward_expand(graph, dec.iou_pred);
     ggml_build_forward_expand(graph, dec.obj_score);
@@ -11911,7 +13018,7 @@ static sam3_prop_output sam3_propagate_single(
 
     // RFD 0011 U0: gallocr reserve+alloc region (mem_attn_alloc_ms).
     SAM3_TIME_BEGIN(_t_prop_alloc);
-    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx0);
@@ -11919,16 +13026,62 @@ static sam3_prop_output sam3_propagate_single(
     }
     SAM3_TIME_END(mem_attn_alloc_ms, _t_prop_alloc);
 
+    o_masks = dec.masks; o_iou = dec.iou_pred; o_obj = dec.obj_score;
+    o_sam = dec.sam_token; o_mtok = dec.mask_tokens;
+    if (use_gcache) {
+        // Stash the stage graph for reuse (CLAUDE.md addendum 4). Released on
+        // any key change, tracker reset, or compute failure.
+        gc.ctx = ctx0; gc.graph = graph; gc.galloc = galloc; gc.key = gkey;
+        gc.curr_in = curr_in; gc.src_pos = src_pos_t;
+        gc.prompt = prompt_t; gc.prompt_pos = prompt_pos_t;
+        gc.rope_q = rope_q_t; gc.rope_k = rope_k_t;
+        gc.sparse = sparse_in; gc.image_pe = image_pe; gc.dense = dense_emb;
+        gc.trk_s0 = trk_s0; gc.trk_s1 = trk_s1;
+        gc.tpos = tpos_leaf; gc.ptr = ptr_leaf; gc.ptr_pos = ptr_pos_leaf;
+        for (int i = 0; i < 16; ++i) {
+            gc.slot_feat[i] = slot_feat_leaf[i];
+            gc.slot_pe[i]   = slot_pe_leaf[i];
+        }
+        gc.masks = o_masks; gc.iou = o_iou; gc.obj = o_obj;
+        gc.sam_token = o_sam; gc.mask_tokens = o_mtok;
+    }
+    }  // end build path (gcache_hit skips straight to the input uploads)
+
     if (use_cml_ma) {
         // Inject the CoreML mem-attn output as the decoder's conditioned input.
         ggml_backend_tensor_set(cond_spatial, cml_cond.data(), 0, cml_cond.size() * sizeof(float));
     } else {
         // Upload prompt data
-        ggml_backend_tensor_set(prompt_t, pd.prompt.data(), 0, pd.prompt.size() * sizeof(float));
-        ggml_backend_tensor_set(prompt_pos_t, pd.prompt_pos.data(), 0, pd.prompt_pos.size() * sizeof(float));
-        ggml_backend_tensor_set(rope_q_t, rope_q_reord.data(), 0, rope_q_reord.size() * sizeof(float));
+        if (prompt_t) {
+            ggml_backend_tensor_set(prompt_t, pd.prompt.data(), 0, pd.prompt.size() * sizeof(float));
+            ggml_backend_tensor_set(prompt_pos_t, pd.prompt_pos.data(), 0, pd.prompt_pos.size() * sizeof(float));
+        } else if (device_prompt) {
+            // Increment 3: spatial region D2D from the bank slots; the small
+            // tpos + pointer blocks are the only prompt uploads left (~34 KB).
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "sam3_propagate_single: device prompt assembly engaged "
+                        "(%d slots x %d tokens + %d ptr tokens)\n",
+                        n_sel, N_per_slot, pd.num_obj_ptr_tokens);
+            }
+            ggml_backend_tensor_set(tpos_leaf, tpos_sel.data(), 0, tpos_sel.size() * sizeof(float));
+            ggml_backend_tensor_set(ptr_leaf, pd.prompt.data(), 0, pd.prompt.size() * sizeof(float));
+            ggml_backend_tensor_set(ptr_pos_leaf, pd.prompt_pos.data(), 0, pd.prompt_pos.size() * sizeof(float));
+            for (int s = 0; s < n_sel; ++s) {
+                sam3_stage_feed(model.transport, mem_bank[sel[s]].spatial_feats,
+                                slot_feat_leaf[s], "prompt_slot_feat");
+                sam3_stage_feed(model.transport, mem_bank[sel[s]].spatial_pe,
+                                slot_pe_leaf[s], "prompt_slot_pe");
+            }
+        }
+        sam3_stagebuf_push(model.transport, tracker.tw_rope_q, rope_q_reord.data(),
+                           rope_q_reord.size() * sizeof(float), rope_q_t,
+                           tracker.pe_gen, "rope_q");
         if (rope_k_t && !rope_k_data.empty())
-            ggml_backend_tensor_set(rope_k_t, rope_k_data.data(), 0, rope_k_data.size() * sizeof(float));
+            sam3_stagebuf_push(model.transport, tracker.tw_rope_k, rope_k_data.data(),
+                               rope_k_data.size() * sizeof(float), rope_k_t,
+                               tracker.pe_gen, "rope_k");
     }
 
     // Set default obj_score when pred_obj_scores=False (older SAM2 models)
@@ -11939,32 +13092,29 @@ static sam3_prop_output sam3_propagate_single(
 
     // Upload src_pos (sinusoidal PE 256-dim) — ggml mem-attn path only.
     if (src_pos_t)
-        ggml_backend_tensor_set(src_pos_t, tracker.cached_sinpe_256.data(), 0,
-                                tracker.cached_sinpe_256.size() * sizeof(float));
+        sam3_stagebuf_push(model.transport, tracker.tw_src_pos, tracker.cached_sinpe_256.data(),
+                           tracker.cached_sinpe_256.size() * sizeof(float), src_pos_t,
+                           tracker.pe_gen, "src_pos");
 
     // Upload not_a_point_embed, image_pe, dense_emb from state PE cache
     sam3_populate_pe_cache(state, model);
-    ggml_backend_tensor_set(sparse_in, state.not_a_point_cache, 0, D * sizeof(float));
-    ggml_backend_tensor_set(image_pe, state.dense_pe_cache.data(), 0,
-                            state.dense_pe_cache.size() * sizeof(float));
-    ggml_backend_tensor_set(dense_emb, state.dense_nomask_cache.data(), 0,
-                            state.dense_nomask_cache.size() * sizeof(float));
+    sam3_stagebuf_push(model.transport, state.tw_sparse, state.not_a_point_cache,
+                       D * sizeof(float), sparse_in, state.pe_cache_gen, "prop_sparse");
+    sam3_stagebuf_push(model.transport, state.tw_image_pe, state.dense_pe_cache.data(),
+                       state.dense_pe_cache.size() * sizeof(float), image_pe,
+                       state.pe_cache_gen, "prop_pe");
+    sam3_stagebuf_push(model.transport, state.tw_dense, state.dense_nomask_cache.data(),
+                       state.dense_nomask_cache.size() * sizeof(float), dense_emb,
+                       state.pe_cache_gen, "prop_dense");
 
-    // Copy tracker features from state to fresh input tensors
+    // Copy tracker features from state to fresh input tensors (transport
+    // driver: host = today's round-trip, device = same-backend D2D).
     {
         if (curr) {  // ggml mem-attn path only (CoreML reads neck_trk[2] itself)
-            std::vector<float> c2(D * N);
-            ggml_backend_tensor_get(state.neck_trk[2], c2.data(), 0, D * N * sizeof(float));
-            ggml_backend_tensor_set(curr, c2.data(), 0, D * N * sizeof(float));
+            sam3_stage_feed(model.transport, state.neck_trk[2], curr_in, "prop_curr");
         }
-
-        std::vector<float> s0(D * H0 * H0);
-        ggml_backend_tensor_get(state.neck_trk[0], s0.data(), 0, D * H0 * H0 * sizeof(float));
-        ggml_backend_tensor_set(trk_s0, s0.data(), 0, D * H0 * H0 * sizeof(float));
-
-        std::vector<float> s1(D * H1 * H1);
-        ggml_backend_tensor_get(state.neck_trk[1], s1.data(), 0, D * H1 * H1 * sizeof(float));
-        ggml_backend_tensor_set(trk_s1, s1.data(), 0, D * H1 * H1 * sizeof(float));
+        sam3_stage_feed(model.transport, state.neck_trk[0], trk_s0, "prop_trk_s0");
+        sam3_stage_feed(model.transport, state.neck_trk[1], trk_s1, "prop_trk_s1");
     }
 
     // RFD 0011 U0: backend compute of the shared mem-attn + mask-decoder graph
@@ -11972,8 +13122,12 @@ static sam3_prop_output sam3_propagate_single(
     // because the decoder is fused into this same graph on the EdgeTAM path).
     SAM3_TIME_BEGIN(_t_prop_compute);
     if (!sam3_graph_compute(model.backend, graph, 4)) {
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
+        if (use_gcache) {
+            sam3_prop_gcache_release(gc);  // never keep a wedged graph
+        } else {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+        }
         return output;
     }
     SAM3_TIME_END(mem_attn_compute_ms, _t_prop_compute);
@@ -11988,7 +13142,7 @@ static sam3_prop_output sam3_propagate_single(
     if (use_multimask) {
         // Read all 4 IoU predictions
         std::vector<float> all_ious(num_mask_tokens);
-        ggml_backend_tensor_get(dec.iou_pred, all_ious.data(), 0, num_mask_tokens * sizeof(float));
+        ggml_backend_tensor_get(o_iou, all_ious.data(), 0, num_mask_tokens * sizeof(float));
 
         // Multimask uses mask tokens 1-3 (skip token 0 which is the single-mask output)
         int best_idx = 1;
@@ -12002,35 +13156,37 @@ static sam3_prop_output sam3_propagate_single(
         output.mask_w = mhw;
         output.mask_logits.resize(mhw * mhw);
         // Read best mask (offset by best_idx * mhw * mhw)
-        ggml_backend_tensor_get(dec.masks, output.mask_logits.data(),
+        ggml_backend_tensor_get(o_masks, output.mask_logits.data(),
                                 best_idx * mhw * mhw * sizeof(float), mhw * mhw * sizeof(float));
         output.iou_scores.resize(1);
         output.iou_scores[0] = best_iou;
-        ggml_backend_tensor_get(dec.obj_score, &output.obj_score, 0, sizeof(float));
+        ggml_backend_tensor_get(o_obj, &output.obj_score, 0, sizeof(float));
 
         // Object pointer token: use best multimask token if use_multimask_token_for_obj_ptr
         output.sam_token.resize(D);
-        if (hp.use_multimask_token_for_obj_ptr && dec.mask_tokens) {
-            ggml_backend_tensor_get(dec.mask_tokens, output.sam_token.data(),
+        if (hp.use_multimask_token_for_obj_ptr && o_mtok) {
+            ggml_backend_tensor_get(o_mtok, output.sam_token.data(),
                                     best_idx * D * sizeof(float), D * sizeof(float));
         } else {
-            ggml_backend_tensor_get(dec.sam_token, output.sam_token.data(), 0, D * sizeof(float));
+            ggml_backend_tensor_get(o_sam, output.sam_token.data(), 0, D * sizeof(float));
         }
     } else {
         output.n_masks = 1;
         output.mask_h = mhw;
         output.mask_w = mhw;
         output.mask_logits.resize(mhw * mhw);
-        ggml_backend_tensor_get(dec.masks, output.mask_logits.data(), 0, mhw * mhw * sizeof(float));
+        ggml_backend_tensor_get(o_masks, output.mask_logits.data(), 0, mhw * mhw * sizeof(float));
         output.iou_scores.resize(1);
-        ggml_backend_tensor_get(dec.iou_pred, output.iou_scores.data(), 0, sizeof(float));
-        ggml_backend_tensor_get(dec.obj_score, &output.obj_score, 0, sizeof(float));
+        ggml_backend_tensor_get(o_iou, output.iou_scores.data(), 0, sizeof(float));
+        ggml_backend_tensor_get(o_obj, &output.obj_score, 0, sizeof(float));
         output.sam_token.resize(D);
-        ggml_backend_tensor_get(dec.sam_token, output.sam_token.data(), 0, D * sizeof(float));
+        ggml_backend_tensor_get(o_sam, output.sam_token.data(), 0, D * sizeof(float));
     }
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
+    if (!use_gcache) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+    }
     return output;
 }
 
@@ -12154,6 +13310,19 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
     }
     for (auto it = tracker.masklets.begin(); it != tracker.masklets.end();) {
         if (frame_idx - it->last_seen > tracker.params.max_keep_alive) {
+            // Increment 3: recycle the evicted instance's slot/ptr tensors so
+            // whole-bank eviction doesn't leak until reset either.
+            {
+                auto mb = tracker.mem_banks.find(it->instance_id);
+                if (mb != tracker.mem_banks.end())
+                    for (const auto& s : mb->second) sam3_recycle_slot(tracker, s);
+                auto pb = tracker.ptr_banks.find(it->instance_id);
+                if (pb != tracker.ptr_banks.end())
+                    for (const auto& p : pb->second)
+                        if (p.second && p.second->buffer)
+                            tracker.ptr_free.push_back({p.second, nullptr});
+                tracker.ptr_host.erase(it->instance_id);
+            }
             tracker.mem_banks.erase(it->instance_id);
             tracker.ptr_banks.erase(it->instance_id);
             // RFD 0011 U3: evict the per-instance motion model alongside its
@@ -12274,12 +13443,33 @@ static bool sam3_encode_memory(
     // RFD 0011 U0: memory-encoder graph CONSTRUCTION region (mem_encoder_build_ms).
     // U1 will reuse this graph across frames; build_ms+alloc_ms should drop to ~0.
     SAM3_TIME_BEGIN(_t_mem_build);
+    // Increment 6b: cached memory-encoder graph (CLAUDE.md addendum 4) — fixed
+    // shapes at a given feat size, so steady state hits every credible frame.
+    const bool use_mgc = model.transport.kind == SAM3_TRANSPORT_DEVICE;
+    uint64_t mkey = 1469598103934665603ull;
+    sam3_key_mix(mkey, (uint64_t)H);
+    sam3_key_mix(mkey, (uint64_t)INTERPOL);
+    sam3_key_mix(mkey, (uint64_t)D);
+    auto& mgc = tracker.gc_memenc;
+    const bool mgc_hit = use_mgc && mgc.ctx && mgc.key == mkey;
+    if (use_mgc && !mgc_hit && mgc.ctx) sam3_stage_gcache_release(mgc);
+
+    struct ggml_context* ctx0 = nullptr;
+    struct ggml_tensor* mask_in = nullptr;
+    struct ggml_tensor* pix_in_raw = nullptr;
+    struct ggml_tensor* mo = nullptr;
+    struct ggml_cgraph* g = nullptr;
+    struct ggml_gallocr* ga = nullptr;
+    if (mgc_hit) {
+        ctx0 = mgc.ctx; g = mgc.graph; ga = mgc.galloc;
+        mask_in = mgc.in[0]; pix_in_raw = mgc.in[1]; mo = mgc.out[0];
+    } else {
     const size_t bs = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
     struct ggml_init_params gp = {bs, nullptr, true};
-    auto* ctx0 = ggml_init(gp);
+    ctx0 = ggml_init(gp);
     if (!ctx0) return false;
 
-    auto* mask_in = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, INTERPOL, INTERPOL, 1, 1);
+    mask_in = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, INTERPOL, INTERPOL, 1, 1);
     ggml_set_name(mask_in, "mem_mask");
     ggml_set_input(mask_in);
 
@@ -12302,7 +13492,7 @@ static bool sam3_encode_memory(
 
     // Pixel projection — use fresh input tensor to avoid pulling in the
     // entire ViT+neck recomputation from state.neck_trk[2]'s dependency tree
-    auto* pix_in_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+    pix_in_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
     ggml_set_name(pix_in_raw, "mem_pix_feat");
     ggml_set_input(pix_in_raw);
     auto* pix_in = ggml_cont(ctx0, ggml_permute(ctx0, pix_in_raw, 2, 0, 1, 3));
@@ -12320,19 +13510,19 @@ static bool sam3_encode_memory(
                                      model.mem_enc.fuser_fc2_w[i], model.mem_enc.fuser_fc2_b[i],
                                      model.mem_enc.fuser_gamma[i]);
     auto* fused_out = ggml_cont(ctx0, ggml_permute(ctx0, fused, 2, 0, 1, 3));
-    auto* mo = ggml_conv_2d(ctx0, model.mem_enc.out_proj_w, fused_out, 1, 1, 0, 0, 1, 1);
+    mo = ggml_conv_2d(ctx0, model.mem_enc.out_proj_w, fused_out, 1, 1, 0, 0, 1, 1);
     mo = ggml_add(ctx0, mo, ggml_reshape_4d(ctx0, model.mem_enc.out_proj_b, 1, 1, MD, 1));
     mo = ggml_cont(ctx0, ggml_permute(ctx0, mo, 1, 2, 0, 3));
     ggml_set_name(mo, "mem_out");
     ggml_set_output(mo);
 
-    auto* g = ggml_new_graph_custom(ctx0, 16384, false);
+    g = ggml_new_graph_custom(ctx0, 16384, false);
     ggml_build_forward_expand(g, mo);
     SAM3_TIME_END(mem_encoder_build_ms, _t_mem_build);
 
     // RFD 0011 U0: gallocr reserve+alloc region (mem_encoder_alloc_ms).
     SAM3_TIME_BEGIN(_t_mem_alloc);
-    auto* ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!ggml_gallocr_reserve(ga, g) || !ggml_gallocr_alloc_graph(ga, g)) {
         ggml_gallocr_free(ga);
         ggml_free(ctx0);
@@ -12340,18 +13530,24 @@ static bool sam3_encode_memory(
     }
     SAM3_TIME_END(mem_encoder_alloc_ms, _t_mem_alloc);
 
-    ggml_backend_tensor_set(mask_in, m_interp.data(), 0, m_interp.size() * sizeof(float));
-    // Copy pixel features from state tensor to fresh input
-    {
-        std::vector<float> pix_data(D * H * H);
-        ggml_backend_tensor_get(state.neck_trk[2], pix_data.data(), 0, D * H * H * sizeof(float));
-        ggml_backend_tensor_set(pix_in_raw, pix_data.data(), 0, D * H * H * sizeof(float));
+    if (use_mgc) {
+        mgc.ctx = ctx0; mgc.graph = g; mgc.galloc = ga; mgc.key = mkey;
+        mgc.in[0] = mask_in; mgc.in[1] = pix_in_raw; mgc.out[0] = mo;
     }
+    }  // end build path (mgc_hit skips straight to the input uploads)
+
+    ggml_backend_tensor_set(mask_in, m_interp.data(), 0, m_interp.size() * sizeof(float));
+    // Copy pixel features from state tensor to fresh input (transport driver)
+    sam3_stage_feed(model.transport, state.neck_trk[2], pix_in_raw, "mem_pix_feat");
     // RFD 0011 U0: backend compute of the memory encoder (mem_encoder_compute_ms).
     SAM3_TIME_BEGIN(_t_mem_compute);
     if (!sam3_graph_compute(model.backend, g, 4)) {
-        ggml_gallocr_free(ga);
-        ggml_free(ctx0);
+        if (use_mgc) {
+            sam3_stage_gcache_release(mgc);  // never keep a wedged graph
+        } else {
+            ggml_gallocr_free(ga);
+            ggml_free(ctx0);
+        }
         return false;
     }
     SAM3_TIME_END(mem_encoder_compute_ms, _t_mem_compute);
@@ -12362,11 +13558,21 @@ static bool sam3_encode_memory(
     // and pushing/evicting slots in tracker.mem_banks.
     SAM3_TIME_BEGIN(_t_mem_bank);
 
-    std::vector<float> md(MD * H * H);
-    ggml_backend_tensor_get(mo, md.data(), 0, md.size() * sizeof(float));
+    // Increment 4: on the CUDA device driver the EdgeTAM chain keeps the
+    // memenc output on device (the perceiver feeds from `mo` by D2D while its
+    // graph memory is still live), so the 1 MB download disappears. Gated on
+    // is_edgetam(): SAM2.1's no_obj_embed_spatial branch below mutates md on
+    // the host and must keep the verbatim path (design §3.4-4).
+    const bool device_chain = model.transport.kind == SAM3_TRANSPORT_DEVICE &&
+                              hp.is_edgetam() && hp.has_perceiver;
+    std::vector<float> md;
+    if (!device_chain) {
+        md.resize((size_t)MD * H * H);
+        ggml_backend_tensor_get(mo, md.data(), 0, md.size() * sizeof(float));
+    }
 
     // Apply no_obj_embed_spatial if occluded (SAM2.1 only — EdgeTAM does not have this)
-    if (obj_score <= 0.0f && model.no_obj_embed_spatial) {
+    if (!device_chain && obj_score <= 0.0f && model.no_obj_embed_spatial) {
         std::vector<float> no_obj_emb(MD);
         auto* noe = model.no_obj_embed_spatial;
         if (noe->type == GGML_TYPE_F16) {
@@ -12393,11 +13599,12 @@ static bool sam3_encode_memory(
 
         std::vector<float> perc_latents, perc_pos;
         if (!edgetam_perceiver_forward(model, md, mem_pos, H, H,
-                                        perc_latents, perc_pos)) {
+                                        perc_latents, perc_pos,
+                                        device_chain ? mo : nullptr,
+                                        device_chain ? &tracker : nullptr)) {
             fprintf(stderr, "%s: perceiver forward failed\n", __func__);
             SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
-            ggml_gallocr_free(ga);
-            ggml_free(ctx0);
+            if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
             return false;
         }
 
@@ -12442,25 +13649,24 @@ static bool sam3_encode_memory(
             }
         }
 #endif
-        // Store perceiver output: [MD=64, N_perc] (N_1d + N_2d latents)
-        auto* st = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, MD, N_perc);
-        auto* sb = ggml_backend_alloc_buffer(model.backend, MD * N_perc * sizeof(float));
-        struct ggml_tallocr ta_perc = ggml_tallocr_new(sb);
-        ggml_tallocr_alloc(&ta_perc, st);
-        tracker.owned_buffers.push_back(sb);
+        // Store perceiver output + PE (increment 3: fixed-ring pair — reuses a
+        // recycled tensor pair in place instead of allocating per frame)
+        struct ggml_tensor* st = nullptr;
+        struct ggml_tensor* spe = nullptr;
+        ggml_backend_buffer_t slot_buf = nullptr;
+        if (!sam3_acquire_slot_pair(tracker, model, MD, N_perc, 1, &st, &spe, &slot_buf)) {
+            fprintf(stderr, "%s: slot pair alloc failed\n", __func__);
+            SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
+            if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
+            return false;
+        }
         ggml_backend_tensor_set(st, perc_latents.data(), 0, MD * N_perc * sizeof(float));
-
-        // Store perceiver PE: [MD=64, 512] (first 256 zeros, last 256 sinusoidal)
-        auto* spe = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, MD, N_perc);
-        auto* speb = ggml_backend_alloc_buffer(model.backend, MD * N_perc * sizeof(float));
-        struct ggml_tallocr ta_perc2 = ggml_tallocr_new(speb);
-        ggml_tallocr_alloc(&ta_perc2, spe);
-        tracker.owned_buffers.push_back(speb);
         ggml_backend_tensor_set(spe, perc_pos.data(), 0, MD * N_perc * sizeof(float));
 
         sam3_memory_slot slot;
         slot.spatial_feats = st;
         slot.spatial_pe = spe;
+        slot.buf = slot_buf;
         slot.frame_index = frame_idx;
         slot.is_cond_frame = is_cond;
         auto& bk = tracker.mem_banks[inst_id];
@@ -12468,44 +13674,48 @@ static bool sam3_encode_memory(
         // RFD 0011 U3: trim to the memory POOL cap (>= num_maskmem) rather than
         // exactly num_maskmem, so sam3_select_memory_frames has a real choice of
         // motion-consistent slots. Still drop the oldest non-cond slot first.
+        // Increment 3: evicted slots recycle their tensors instead of leaking.
         while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
             bool removed = false;
             for (auto it = bk.begin(); it != bk.end(); ++it)
                 if (!it->is_cond_frame) {
+                    sam3_recycle_slot(tracker, *it);
                     bk.erase(it);
                     removed = true;
                     break;
                 }
-            if (!removed) bk.erase(bk.begin() + 1);
+            if (!removed) {
+                sam3_recycle_slot(tracker, bk[1]);
+                bk.erase(bk.begin() + 1);
+            }
         }
         SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
-        ggml_gallocr_free(ga);
-        ggml_free(ctx0);
+        if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
         return true;
     }
 
     // ── Standard path (SAM2/SAM3): store raw [MD, H, H] features ────────
-    // Store spatial features
-    auto* st = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, MD, H, H, 1);
-    auto* sb = ggml_backend_alloc_buffer(model.backend, MD * H * H * sizeof(float));
-    struct ggml_tallocr ta = ggml_tallocr_new(sb);
-    ggml_tallocr_alloc(&ta, st);
-    tracker.owned_buffers.push_back(sb);
+    // (increment 3: fixed-ring pair — reuses a recycled tensor pair in place)
+    struct ggml_tensor* st = nullptr;
+    struct ggml_tensor* spe = nullptr;
+    ggml_backend_buffer_t slot_buf = nullptr;
+    if (!sam3_acquire_slot_pair(tracker, model, MD, H, H, &st, &spe, &slot_buf)) {
+        fprintf(stderr, "%s: slot pair alloc failed\n", __func__);
+        SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
+        if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
+        return false;
+    }
     ggml_backend_tensor_set(st, md.data(), 0, md.size() * sizeof(float));
 
     // Compute and store sinusoidal spatial PE
     sam3_ensure_tracker_pe_caches(tracker, hp, H);
     const auto& pe_data = tracker.cached_sinpe_64;
-    auto* spe = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, MD, H, H, 1);
-    auto* speb = ggml_backend_alloc_buffer(model.backend, MD * H * H * sizeof(float));
-    struct ggml_tallocr ta2 = ggml_tallocr_new(speb);
-    ggml_tallocr_alloc(&ta2, spe);
-    tracker.owned_buffers.push_back(speb);
     ggml_backend_tensor_set(spe, pe_data.data(), 0, pe_data.size() * sizeof(float));
 
     sam3_memory_slot slot;
     slot.spatial_feats = st;
     slot.spatial_pe = spe;
+    slot.buf = slot_buf;
     slot.frame_index = frame_idx;
     slot.is_cond_frame = is_cond;
     auto& bk = tracker.mem_banks[inst_id];
@@ -12513,19 +13723,23 @@ static bool sam3_encode_memory(
     // RFD 0011 U3: trim to the memory POOL cap (see perceiver path above and
     // sam3_mem_pool_cap). Selection of the attended num_maskmem subset is the
     // motion-aware sam3_select_memory_frames; eviction here only bounds storage.
+    // Increment 3: evicted slots recycle their tensors instead of leaking.
     while ((int)bk.size() > sam3_mem_pool_cap(hp.num_maskmem)) {
         bool removed = false;
         for (auto it = bk.begin(); it != bk.end(); ++it)
             if (!it->is_cond_frame) {
+                sam3_recycle_slot(tracker, *it);
                 bk.erase(it);
                 removed = true;
                 break;
             }
-        if (!removed) bk.erase(bk.begin() + 1);
+        if (!removed) {
+            sam3_recycle_slot(tracker, bk[1]);
+            bk.erase(bk.begin() + 1);
+        }
     }
     SAM3_TIME_END(memory_bank_update_ms, _t_mem_bank);
-    ggml_gallocr_free(ga);
-    ggml_free(ctx0);
+    if (!use_mgc) { ggml_gallocr_free(ga); ggml_free(ctx0); }
     return true;
 }
 
@@ -12533,19 +13747,40 @@ static void sam3_store_obj_ptr(
     sam3_tracker& tracker, const sam3_model& model,
     int inst_id, const float* pd, int frame_idx) {
     const int D = model.hparams.neck_dim;
-    if (!tracker.ctx) {
-        struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
-        tracker.ctx = ggml_init(tp);
+    // Increment 3: reuse a recycled pointer tensor when available (fixes the
+    // 1 KB/credible-frame buffer leak and metadata accretion in tracker.ctx).
+    struct ggml_tensor* pt = nullptr;
+    for (size_t i = 0; i < tracker.ptr_free.size(); ++i) {
+        auto& r = tracker.ptr_free[i];
+        if (r.pt && r.pt->ne[0] == D && r.pt->ne[1] == 1) {
+            pt = r.pt;
+            tracker.ptr_free.erase(tracker.ptr_free.begin() + i);
+            break;
+        }
     }
-    auto* pt = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, D, 1);
-    auto* pb = ggml_backend_alloc_buffer(model.backend, D * sizeof(float));
-    struct ggml_tallocr ta = ggml_tallocr_new(pb);
-    ggml_tallocr_alloc(&ta, pt);
-    tracker.owned_buffers.push_back(pb);
+    if (!pt) {
+        if (!tracker.ctx) {
+            struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
+            tracker.ctx = ggml_init(tp);
+        }
+        pt = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, D, 1);
+        auto* pb = ggml_backend_alloc_buffer(model.backend, D * sizeof(float));
+        struct ggml_tallocr ta = ggml_tallocr_new(pb);
+        ggml_tallocr_alloc(&ta, pt);
+        tracker.owned_buffers.push_back(pb);
+    }
     ggml_backend_tensor_set(pt, pd, 0, D * sizeof(float));
     auto& bk = tracker.ptr_banks[inst_id];
     bk.push_back({frame_idx, pt});
-    while ((int)bk.size() > model.hparams.max_obj_ptrs) bk.erase(bk.begin());
+    // Host mirror (increment 3): strictly parallel to the bank — the device
+    // prompt assembly reads pointer values from here instead of D2H gets.
+    auto& hm = tracker.ptr_host[inst_id];
+    hm.emplace_back(pd, pd + D);
+    while ((int)bk.size() > model.hparams.max_obj_ptrs) {
+        if (bk.front().second) tracker.ptr_free.push_back({bk.front().second, nullptr});
+        bk.erase(bk.begin());
+        if (!hm.empty()) hm.erase(hm.begin());
+    }
 }
 
 sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
@@ -12921,6 +14156,25 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     for (auto* b : tracker.owned_buffers)
         if (b) ggml_backend_buffer_free(b);
     tracker.owned_buffers.clear();
+    // Stage-transport twins (increment 2): release with the other device
+    // resources; they repopulate lazily on the next device-mode propagate.
+    sam3_stagebuf_release(tracker.tw_rope_q);
+    sam3_stagebuf_release(tracker.tw_rope_k);
+    sam3_stagebuf_release(tracker.tw_src_pos);
+    sam3_stagebuf_release(tracker.tw_perc_pos);
+    sam3_stagebuf_release(tracker.tw_perc_lat1);
+    sam3_stagebuf_release(tracker.tw_perc_lat2);
+    // Increment 3: the recycling lists hold pointers into owned_buffers'
+    // storage (freed just above) — clear them, never free through them.
+    tracker.slot_free.clear();
+    tracker.ptr_free.clear();
+    tracker.ptr_host.clear();
+    // Increment 6: drop the cached stage graphs (their leaves may reference
+    // dims tied to the old session; they rebuild on the next device frame).
+    sam3_prop_gcache_release(tracker.gc_prop);
+    sam3_stage_gcache_release(tracker.gc_memenc);
+    sam3_stage_gcache_release(tracker.gc_perc1);
+    sam3_stage_gcache_release(tracker.gc_perc2);
     if (tracker.ctx) {
         ggml_free(tracker.ctx);
         tracker.ctx = nullptr;

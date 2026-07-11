@@ -222,6 +222,11 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params & params);
 /* Free all resources held by a loaded model. */
 void sam3_free_model(sam3_model & model);
 
+// Active ggml backend name for the loaded model (e.g. "CUDA0", "Vulkan0", "Metal",
+// "CPU"). Lets callers verify the GPU accelerator actually initialized rather than
+// silently falling back to CPU. Returns "none" if no backend is set.
+const char* sam3_backend_name(const sam3_model& model);
+
 /* Returns true if the model was loaded as visual-only (no text/detector path).
 ** SAM2 models are always considered visual-only. */
 bool sam3_is_visual_only(const sam3_model & model);
@@ -360,16 +365,47 @@ sam3_image      sam3_decode_video_frame(const std::string & video_path, int fram
 sam3_video_info sam3_get_video_info(const std::string & video_path);
 
 /*
-** ── RFD 0011 U8: threaded encoder-ahead (CoreML) ─────────────────────────
-** The producer thread preprocesses + CoreML-encodes frame N+1 off the main
-** thread, then hands the 3 neck levels here; the next sam3_propagate_frame's
-** encode step consumes them (skipping preprocess + encode) so the encoder leg
-** overlaps the consumer. Built only with SAM3_COREML; no-ops otherwise.
+** ── RFD 0011 U8: threaded encoder-ahead (backend-agnostic seam) ──────────
+** The producer thread preprocesses + encodes frame N+1 off the main thread,
+** then hands the 3 neck levels here; the next sam3_propagate_frame's encode
+** step consumes them (skipping preprocess + encode) so the encoder leg
+** overlaps the consumer. The producer engine is CoreML on Apple or a second
+** ggml-CUDA backend instance on NVIDIA (sam3_encoder_ahead_* below); the
+** seam itself is raw floats — available on every build. Names keep the
+** historic sam3_coreml_ prefix for source compatibility.
 */
 void              sam3_coreml_set_prefetched_neck(const float* neck0,
                                                   const float* neck1,
                                                   const float* neck2);
 std::vector<float> sam3_coreml_preprocess_image(const sam3_image& image, int img_size);
+
+/*
+** ── RFD 0011: ggml encoder-ahead producer (CUDA) ─────────────────────────
+** NVIDIA counterpart of the CoreML producer encoder: a SECOND ggml backend
+** instance (own CUDA stream) runs the EdgeTAM encoder graph for frame N+1
+** concurrently with the consumer's mem-attn/decoder work for frame N.
+** create returns NULL unless the model's active backend is CUDA and the
+** model is EdgeTAM. encode writes the 3 neck levels in the prefetch-seam
+** layout ([D,W,H] contiguous floats; 256*256*256 / 256*128*128 / 256*64*64).
+** Same-GPU producer/consumer contention is hardware-dependent — A/B on the
+** target GPU before defaulting on (the capi gates this behind
+** SAM3_GGML_ENCODER_AHEAD=1).
+*/
+struct sam3_encoder_ahead;
+sam3_encoder_ahead* sam3_encoder_ahead_create(const sam3_model& model);
+bool                sam3_encoder_ahead_encode(sam3_encoder_ahead* ea, const sam3_model& model,
+                                              const sam3_image& image,
+                                              float* neck0, float* neck1, float* neck2);
+void                sam3_encoder_ahead_destroy(sam3_encoder_ahead* ea);
+
+// Device-resident encoder-ahead seam (CUDA device transport only): the
+// producer encodes into per-slot persistent DEVICE tensors and the consumer
+// D2D-copies them into state — no 2×84 MB host round trip per frame. Both
+// return false when unavailable (host transport, non-CUDA build, bad slot,
+// slot not device-filled); callers then fall back to the host-float seam.
+bool sam3_encoder_ahead_encode_dev(sam3_encoder_ahead* ea, const sam3_model& model,
+                                   const sam3_image& image, int slot);
+bool sam3_set_prefetched_neck_dev(sam3_encoder_ahead* ea, int slot);
 
 /*****************************************************************************
 ** Test and Debug API

@@ -39,6 +39,21 @@ sam3.cpp — a C++14 port of Meta's SAM 3 (Segment Anything Model 3) using ggml 
 
 **Functions that follow this pattern:** `sam3_segment_pcs` (5 sub-graphs), `sam3_segment_pvs`, `sam3_propagate_single`, `sam3_encode_memory`.
 
+4. **Device-transport addendum (CUDA stage-graph reuse).** On the CUDA
+   device-transport driver (`sam3_transport`; see `report/CUDA-RESIDENCY-DESIGN.md`
+   in the trackbench repo) a stage MAY keep its own `ggml_context` +
+   `ggml_cgraph` + `ggml_gallocr` alive across frames and recompute it in place
+   (`sam3_stage_cache`), instead of rule 1's build→compute→free-per-call,
+   PROVIDED: (a) the cached graph is keyed on every shape/config input that
+   affects its topology and is released + rebuilt on any key change; (b) stages
+   are never merged — one cached graph per stage, so rule 1's buffer-aliasing
+   rationale still holds within each compute; (c) all per-frame data still
+   enters through fresh input leaves (rule 2 untouched). This is what lets
+   ggml-CUDA's graph capture reach steady replay (stable node/leaf data
+   pointers) and removes the per-frame cudaMalloc/free churn. Precedent: the
+   encoder's persistent `state.neck_trk` buffers (steady-state fast path). The
+   host driver (mac/Metal/CPU) keeps the verbatim per-call pattern.
+
 ## Implementation plan
 
 All work follows the phased plan in `PLAN.md`. Read it before starting any phase. Each phase has concrete steps, verification criteria, and the exact structs/functions to implement.

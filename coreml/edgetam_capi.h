@@ -9,6 +9,17 @@
 
 #include <stdint.h>
 
+// ET_API: symbol visibility for the SAM3_CAPI_SHARED build (sam3capi.dll — the
+// Windows/MSVC cgo boundary; see CMakeLists.txt). extern "C" alone does not
+// export symbols from an MSVC DLL, so the DLL build defines ET_CAPI_BUILD_DLL
+// and every entry point below carries __declspec(dllexport). Static builds
+// (Mac CoreML, Linux CUDA, mingw Vulkan) expand ET_API to nothing.
+#if defined(_WIN32) && defined(ET_CAPI_BUILD_DLL)
+  #define ET_API __declspec(dllexport)
+#else
+  #define ET_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -33,23 +44,23 @@ typedef struct {
 // path + ggml fallback). models_dir = dir holding the 4 CoreML .mlpackages; if
 // non-empty, the CoreML encoder/mem-attn/decoder stages are enabled. Returns
 // NULL on failure.
-edgetam_tracker_t edgetam_capi_create(const char* models_dir, const char* ggml_model,
+ET_API edgetam_tracker_t edgetam_capi_create(const char* models_dir, const char* ggml_model,
                                       int use_samurai, int use_lifecycle);
 
 // Seed the target from a box on frame 0. rgb = contiguous RGB24 (w*h*3 bytes).
 // seed box in PIXELS. Returns 1 on success.
-int edgetam_capi_seed(edgetam_tracker_t t, const uint8_t* rgb, int w, int h, et_box seed_px);
+ET_API int edgetam_capi_seed(edgetam_tracker_t t, const uint8_t* rgb, int w, int h, et_box seed_px);
 
 // Track one frame. rgb = contiguous RGB24 (w*h*3). Returns the per-frame result
 // (box normalized [0,1]); valid==0 when the target is lost this frame.
-et_result edgetam_capi_track(edgetam_tracker_t t, const uint8_t* rgb, int w, int h);
+ET_API et_result edgetam_capi_track(edgetam_tracker_t t, const uint8_t* rgb, int w, int h);
 
 // RFD 0011 U8 mask export — copy the LAST track's binary mask (0/255, row-major,
 // w*h bytes, original-frame resolution) into `out` (capacity `cap`). Writes dims
 // to *w,*h. Returns the byte count (w*h); if cap < w*h nothing is copied and w*h
 // is returned so the caller can size its buffer. 0 => no mask (lost / pre-track).
 // Valid after edgetam_capi_track / edgetam_capi_track_slot on the same handle.
-int edgetam_capi_last_mask(edgetam_tracker_t t, uint8_t* out, int cap, int* w, int* h);
+ET_API int edgetam_capi_last_mask(edgetam_tracker_t t, uint8_t* out, int cap, int* w, int* h);
 
 // RFD 0011 U8 Wave 5 — encoder-ahead threading split. pool_size returns the slot
 // count (0 if CoreML/threading is unavailable). encode_slot (PRODUCER thread)
@@ -57,13 +68,18 @@ int edgetam_capi_last_mask(edgetam_tracker_t t, uint8_t* out, int cap, int* w, i
 // handle. track_slot (CONSUMER thread) consumes slot's prefetched neck + propagates.
 // Go owns slot free/ready coordination (channels) — one writer then one reader per
 // slot, so these are safe to overlap across the two threads on DIFFERENT slots.
-int       edgetam_capi_pool_size(edgetam_tracker_t t);
-int       edgetam_capi_encode_slot(edgetam_tracker_t t, int slot, const uint8_t* rgb, int w, int h);
-et_result edgetam_capi_track_slot(edgetam_tracker_t t, int slot, const uint8_t* rgb, int w, int h);
+ET_API int       edgetam_capi_pool_size(edgetam_tracker_t t);
+ET_API int       edgetam_capi_encode_slot(edgetam_tracker_t t, int slot, const uint8_t* rgb, int w, int h);
+ET_API et_result edgetam_capi_track_slot(edgetam_tracker_t t, int slot, const uint8_t* rgb, int w, int h);
 
-void        edgetam_capi_reset(edgetam_tracker_t t);
-void        edgetam_capi_destroy(edgetam_tracker_t t);
-const char* edgetam_capi_version(void);   // SAM3_VERSION, for cgo link sanity
+ET_API void        edgetam_capi_reset(edgetam_tracker_t t);
+ET_API void        edgetam_capi_destroy(edgetam_tracker_t t);
+ET_API const char* edgetam_capi_version(void);   // SAM3_VERSION, for cgo link sanity
+
+// Active ggml backend name (e.g. "CUDA0", "Vulkan0", "Metal", "CPU", or "none").
+// Lets the Go side assert the GPU backend really initialized — catching a silent
+// CPU fallback that would be "fast and wrong" (cf. Egor part-2 CUDA 12/13 mismatch).
+ET_API const char* edgetam_capi_backend(edgetam_tracker_t t);
 
 #ifdef __cplusplus
 }
