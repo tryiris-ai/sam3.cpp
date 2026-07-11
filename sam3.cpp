@@ -955,6 +955,14 @@ struct edgetam_perceiver {
 
 enum sam3_transport_kind { SAM3_TRANSPORT_HOST = 0, SAM3_TRANSPORT_DEVICE = 1 };
 
+#if defined(GGML_USE_CUDA) && defined(SAM3_PREPROC_CUDA)
+// STEP-5 device frame preprocess (coreml/sam3_preproc.cu): bit-exact CUDA
+// twin of sam3_resize_bilinear + ImageNet normalize, writing f32 CHW into
+// the encoder input tensor's device memory. Host-synchronizes internally.
+extern "C" bool sam3_cuda_preprocess_imagenet(const uint8_t* rgb, int src_w, int src_h,
+                                              float* dst_dev, int img_size);
+#endif
+
 struct sam3_transport {
     sam3_transport_kind kind    = SAM3_TRANSPORT_HOST;
     ggml_backend_t      backend = nullptr;
@@ -5641,11 +5649,32 @@ static bool edgetam_encode_image(sam3_state& state,
 
     // ── Preprocess (same ImageNet normalization as SAM2) ─────────────────
     // RFD 0011 U0: preprocess timed separately from the graph build/alloc/compute.
+    // STEP-5 (plan v1): on the CUDA device-transport path the resize+normalize
+    // moves onto the GPU (coreml/sam3_preproc.cu — bit-exact double-chain twin
+    // of sam3_resize_bilinear, -fmad=false) and the 12.6MB f32 upload becomes a
+    // ~2.7MB u8 upload. SAM3_PREPROC_DEVICE: unset/1 = device path when
+    // available; 0 = CPU path (byte-identical shipped behavior); 2 = VERIFY
+    // (both paths, memcmp, abort on mismatch — the byte gate).
     std::vector<float> img_data;
+    bool preproc_on_device = false;
+#if defined(GGML_USE_CUDA) && defined(SAM3_PREPROC_CUDA)
     {
+        const char* pd = getenv("SAM3_PREPROC_DEVICE");
+        const int pd_mode = pd ? atoi(pd) : 1;
+        if (pd_mode != 0 && model.transport.kind == SAM3_TRANSPORT_DEVICE) {
+            preproc_on_device = true;
+            if (pd_mode == 2) {
+                SAM3_TIME_SCOPE(preprocess_ms);
+                img_data = sam2_preprocess_image(image, img_size);  // reference for VERIFY
+            }
+        }
+    }
+#endif
+    if (!preproc_on_device) {
         SAM3_TIME_SCOPE(preprocess_ms);
         img_data = sam2_preprocess_image(image, img_size);
     }
+    (void)preproc_on_device;
 
     // ── Build graph ──────────────────────────────────────────────────────
     // RFD 0011 U0: graph CONSTRUCTION region (image_encoder_build_ms). U1 will
@@ -5742,7 +5771,38 @@ static bool edgetam_encode_image(sam3_state& state,
     }  // end build path (egc_hit skips straight to the input upload)
 
     // Set input image
+#if defined(GGML_USE_CUDA) && defined(SAM3_PREPROC_CUDA)
+    if (preproc_on_device) {
+        SAM3_TIME_SCOPE(preprocess_ms);
+        bool pd_ok = sam3_cuda_preprocess_imagenet(image.data.data(), image.width,
+                                                   image.height, (float*)inp->data,
+                                                   img_size);
+        if (!pd_ok) {
+            // Fail-soft: fall back to the CPU path for this frame (log once).
+            static bool pd_warned = false;
+            if (!pd_warned) { fprintf(stderr, "%s: device preprocess failed - CPU fallback\n", __func__); pd_warned = true; }
+            if (img_data.empty()) img_data = sam2_preprocess_image(image, img_size);
+            ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+        } else if (!img_data.empty()) {
+            // VERIFY mode: download the kernel's output and byte-compare.
+            std::vector<float> dev_out(img_data.size());
+            ggml_backend_tensor_get(inp, dev_out.data(), 0, dev_out.size() * sizeof(float));
+            if (memcmp(dev_out.data(), img_data.data(), img_data.size() * sizeof(float)) != 0) {
+                size_t bad = 0, first = (size_t)-1;
+                for (size_t i = 0; i < img_data.size(); ++i)
+                    if (dev_out[i] != img_data[i]) { ++bad; if (first == (size_t)-1) first = i; }
+                fprintf(stderr, "%s: SAM3_PREPROC_DEVICE=2 BYTE GATE FAIL: %zu/%zu floats differ (first %zu: dev %.9g cpu %.9g)\n",
+                        __func__, bad, img_data.size(), first, (double)dev_out[first], (double)img_data[first]);
+                abort();
+            }
+            fprintf(stderr, "%s: SAM3_PREPROC_DEVICE=2 byte gate PASS (%zu floats)\n", __func__, img_data.size());
+        }
+    } else {
+        ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+    }
+#else
     ggml_backend_tensor_set(inp, img_data.data(), 0, img_data.size() * sizeof(float));
+#endif
 
     // ── Compute ──────────────────────────────────────────────────────────
     // RFD 0011 U0: backend compute region (image_encoder_compute_ms). This is
